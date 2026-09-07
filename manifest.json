@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "updated": "2026-09-08 05:40",
+  "files": [
+    {
+      "path": "feishu-bot.py",
+      "sha256": "667449cbe69386be438b184b0c045662109681e7fc8a5f831aab2956f8078252"
+    },
+    {
+      "path": "run-new-api.sh",
+      "sha256": "99b05dfd5942e77cb4475726ed8dc30d6ca29abd67c5bffeebc3e1c845ca482f"
+    }
+  ],
+  "restart": "bot"
+}
