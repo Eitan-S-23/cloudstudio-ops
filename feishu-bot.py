@@ -28,7 +28,8 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageRequest, Reply
 CONFIG_PATH = Path(__file__).resolve().parent / "feishu-bot-config.json"
 COMMAND_TIMEOUT = 60
 REPLY_CHUNK = 3500
-EXEC_OUTPUT_LIMIT = 3500  # 卡片内命令输出的最大字符数,超长截断
+EXEC_OUTPUT_LIMIT = 3500  # 单张卡片内命令输出的最大字符数,超长按行边界分片多卡片
+MAX_EXEC_CARDS = 12  # 单命令最多回显卡片数(约 42KB),超出建议重定向文件查看
 MAX_MESSAGE_AGE = 300  # 秒:超过该时限的事件(重连补发)不执行,防止重复旧命令
 
 # 事件去重与时效:长连接重连可能重推事件,同一 event_id 只处理一次
@@ -275,30 +276,65 @@ def reply_status_card(api_client, message_id):
         build_reply(api_client, message_id, f"📊 容器状态(卡片降级)\n{lines}")
 
 
+def _split_output_by_line(output, chunk_size=EXEC_OUTPUT_LIMIT):
+    """按行边界把输出切成分片;无换行的超长行退化为硬切。
+
+    保留行完整性,避免表格/日志行被拦腰截断;分片数超过上限时
+    返回 (分片列表, 截断说明)。
+    """
+    if len(output) <= chunk_size:
+        return [output], None
+    chunks = []
+    start = 0
+    while start < len(output) and len(chunks) < MAX_EXEC_CARDS:
+        end = min(start + chunk_size, len(output))
+        if end < len(output):
+            newline = output.rfind("\n", start, end)
+            if newline > start:
+                end = newline + 1
+        chunks.append(output[start:end])
+        start = end
+    if start < len(output):
+        return chunks, f"(输出共 {len(output)} 字符,超出 {MAX_EXEC_CARDS} 张卡片上限,请重定向文件后分段查看,如:命令 > /tmp/out.txt)"
+    return chunks, None
+
+
 def reply_exec_card(api_client, message_id, command, output, returncode, elapsed):
     """命令执行结果以卡片回显:头部为命令,输出放 markdown 组件的代码块。
 
-    代码块用 ``` 围栏,输出内出现的 ``` 会提前闭合围栏,替换为形近字符;
-    退出码非零时头部转红色,便于一眼分辨失败命令。
+    超长输出按行边界分片为多张卡片(尾部标注 x/y),不再截断内容;输出内
+    出现的 ``` 会提前闭合围栏,替换为形近字符;退出码非零时头部转红色,
+    便于一眼分辨失败命令。
     """
-    if len(output) > EXEC_OUTPUT_LIMIT:
-        output = output[:EXEC_OUTPUT_LIMIT] + f"\n…(输出共 {len(output)} 字符,已截断)"
-    safe_output = output.replace("```", "ˋˋˋ")
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "turquoise" if returncode == 0 else "red",
-            "title": {"tag": "plain_text", "content": f"$ {command.replace(chr(10), ' ')[:60]}"},
-        },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": f"**耗时 {elapsed:.1f}s · 退出码 {returncode}**\n```\n{safe_output}\n```",
+    chunks, truncation_note = _split_output_by_line(output)
+    if len(chunks) > 1:
+        # 命令本体只出现在首张,后续卡片头部标注续片序号
+        headers = [f"$ {command.replace(chr(10), ' ')[:60]}"] + [
+            f"(续 {i}/{len(chunks)})" for i in range(2, len(chunks) + 1)
+        ]
+    else:
+        headers = [f"$ {command.replace(chr(10), ' ')[:60]}"]
+    for header, chunk in zip(headers, chunks):
+        safe_output = chunk.replace("```", "ˋˋˋ")
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "turquoise" if returncode == 0 else "red",
+                "title": {"tag": "plain_text", "content": header},
             },
-        ],
-    }
-    if not _reply(api_client, message_id, card, "interactive"):
-        build_reply(api_client, message_id, f"$ {command}\n{output}")
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"**耗时 {elapsed:.1f}s · 退出码 {returncode}**\n```\n{safe_output}\n```",
+                },
+            ],
+        }
+        if not _reply(api_client, message_id, card, "interactive"):
+            # 卡片被拒时降级为分片文本,保证命令永远有响应
+            build_reply(api_client, message_id, f"$ {command}\n{chunk}")
+            return
+    if truncation_note:
+        build_reply(api_client, message_id, truncation_note)
 
 
 def normalize_command(raw_text):
