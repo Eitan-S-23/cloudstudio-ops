@@ -80,6 +80,12 @@ if [[ -f "$APP_DIR/feishu-bot.py" && -f "$APP_DIR/feishu-bot-config.json" ]] \
   fi
 fi
 
+# ---- cc-connect(飞书 codex 机器人,可选组件):随服务启动,幂等 ----
+# 装在 /workspace/cc-connect(见 tencent-codex 私有部署包);目录不在时静默跳过。
+if [[ -f /workspace/cc-connect/start-all.sh ]]; then
+  setsid bash /workspace/cc-connect/start-all.sh </dev/null >/dev/null 2>&1 &
+fi
+
 # task 前台保持一个交互 shell:
 # 1. 终端里始终有 shell 读 stdin,云端浏览器可直连此终端执行运维命令
 #    (Cloud Studio 的快捷键在无头浏览器里不可靠,不能依赖"新建终端");
