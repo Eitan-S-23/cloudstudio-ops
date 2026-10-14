@@ -141,23 +141,33 @@ def container_cpu_cores():
 def container_uptime_seconds():
     """容器运行时长。
 
-    /proc/uptime 在 Cloud Studio 里被虚拟化为容器自身时长,而 /proc/1/stat
-    的 starttime 仍是宿主机时钟域,两者相减为负;未虚拟化的环境里 PID 1
-    反算才是容器时长。先 PID 1 反算,结果落在 [0, uptime] 内才可信,
-    否则直接采用 /proc/uptime 的值。
+    Cloud Studio 把 /proc/uptime 改写成容器自身时长,而 /proc/1/stat 的
+    starttime 仍是宿主机时钟域,两者相减是两个域拼出的伪差值;容器运行
+    越过两域偏移后,伪差值由负转正,能混过 [0, uptime] 检查(2026-10-14
+    曾把 33 天显示成 2 天)。先用 btime + uptime ≈ now 判定两值同域:
+    同域环境按 PID 1 反算容器时长,不同域直接采用 /proc/uptime。
     """
     try:
         uptime = float(Path("/proc/uptime").read_text().split()[0])
     except (OSError, ValueError):
         return None
+    host_domain = False
     try:
-        stat = Path("/proc/1/stat").read_text()
-        start_ticks = int(stat.rsplit(")", 1)[1].split()[19])
-        age = uptime - start_ticks / os.sysconf("SC_CLK_TCK")
-        if 0 <= age <= uptime:
-            return age
-    except (OSError, ValueError, IndexError):
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                host_domain = abs(int(line.split()[1]) + uptime - time.time()) < 300
+                break
+    except (OSError, ValueError):
         pass
+    if host_domain:
+        try:
+            stat = Path("/proc/1/stat").read_text()
+            start_ticks = int(stat.rsplit(")", 1)[1].split()[19])
+            age = uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+            if 0 <= age <= uptime:
+                return age
+        except (OSError, ValueError, IndexError):
+            pass
     return uptime
 
 
