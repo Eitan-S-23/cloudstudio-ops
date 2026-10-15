@@ -8,8 +8,10 @@
 
 status 命令直接读容器自身的 cgroup 与 /proc 数据(free/uptime 读到的是宿主机
 数据,会误导),并以飞书卡片(fields 两列布局)回复;普通命令的输出以卡片
-代码块回显。另有后台线程每分钟拉取 GitHub 部署仓库(OPS_REPO)的清单,
-版本变化时自动下载校验并应用,构成零浏览器额度的自动部署通道。
+代码块回显。clash 命令回复交互卡片:两级选择策略组与节点,点击即切换
+(mihomo 控制 API 127.0.0.1:9090),卡片回传交互经长连接接收。另有后台
+线程每分钟拉取 GitHub 部署仓库(OPS_REPO)的清单,版本变化时自动下载
+校验并应用,构成零浏览器额度的自动部署通道。
 """
 import hashlib
 import json
@@ -19,11 +21,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageRequest, ReplyMessageRequestBody
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 
 CONFIG_PATH = Path(__file__).resolve().parent / "feishu-bot-config.json"
 COMMAND_TIMEOUT = 60
@@ -234,6 +241,246 @@ def build_status_fields():
     pid = find_newapi()
     fields.append(("new-api 服务", f"✅ 运行中(PID {pid})" if pid else "❌ 未运行"))
     return fields
+
+
+# ---------- Clash 节点切换:mihomo 控制接口 + 交互卡片 ----------
+# mihomo 控制 API 监听 127.0.0.1:9090(无 secret):
+#   GET /proxies        列出全部策略组与节点(Selector 组含 now 当前选中)
+#   PUT /proxies/{组名}  body {"name": 节点名} 即完成切换(成功 204 空响应)
+# 卡片回传交互走长连接 CARD 帧,点击到响应需在 3 秒内完成,故切换用同步短请求;
+# 卡片用 2.0 结构(旧版回传交互不支持长连接),按钮 behaviors 里的 value 即回调值。
+
+MIHOMO_API = "http://127.0.0.1:9090"
+CLASH_PAGE_SIZE = 24  # 节点列表每页按钮数(2 列 x 12 行)
+
+
+def mihomo_get_proxies():
+    """读取 /proxies 全量数据;失败抛异常"""
+    request = urllib.request.Request(MIHOMO_API + "/proxies")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8")).get("proxies", {})
+
+
+def mihomo_switch(group, node):
+    """切换 Selector 组的选中节点;成功时 mihomo 返回 204 空响应"""
+    request = urllib.request.Request(
+        MIHOMO_API + "/proxies/" + urllib.parse.quote(group, safe=""),
+        data=json.dumps({"name": node}).encode("utf-8"),
+        method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.status == 204
+
+
+def _callback_button(text, value, style="default"):
+    """卡片 2.0 按钮;behaviors 的 callback 值会原样出现在回调事件的 action.value"""
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "type": style,
+        "width": "fill",
+        "behaviors": [{"type": "callback", "value": value}],
+    }
+
+
+def _button_columns(buttons):
+    """一行内均分排列的按钮组"""
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1, "elements": [button]}
+            for button in buttons
+        ],
+    }
+
+
+def _clash_card(title, subtitle, elements, template="blue"):
+    """clash 交互卡片统一外壳(2.0 结构);update_multi 让更新对所有接收者生效"""
+    header = {"template": template, "title": {"tag": "plain_text", "content": title}}
+    if subtitle:
+        header["subtitle"] = {"tag": "plain_text", "content": subtitle}
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": header,
+        "body": {"elements": elements},
+    }
+
+
+def build_clash_group_card():
+    """一级卡片:策略组清单(仅 Selector 组,GLOBAL 排除),附各组当前选中项"""
+    proxies = mihomo_get_proxies()
+    groups = [
+        (name, info)
+        for name, info in proxies.items()
+        if info.get("type") == "Selector" and name != "GLOBAL"
+    ]
+    elements = []
+    for name, info in groups:
+        now = info.get("now") or "未选择"
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 3,
+                    "vertical_align": "center",
+                    "elements": [{"tag": "markdown", "content": f"**{name}**\n当前:{now}"}],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [_callback_button("切换", {"a": "g", "g": name})],
+                },
+            ],
+        })
+    if elements:
+        elements.append(_button_columns([_callback_button("🔄 刷新当前状态", {"a": "b"})]))
+        subtitle = f"{len(groups)} 个策略组"
+    else:
+        elements.append({"tag": "markdown", "content": "未发现可手动切换(Selector)的策略组。"})
+        subtitle = ""
+    return _clash_card("🔀 Clash 节点切换", subtitle, elements)
+
+
+def build_clash_node_card(group, page=1):
+    """二级卡片:指定策略组的节点按钮网格;当前节点高亮,超过一页时分页"""
+    proxies = mihomo_get_proxies()
+    info = proxies.get(group) or {}
+    if info.get("type") != "Selector":
+        return build_clash_group_card()
+    nodes = list(info.get("all") or [])
+    now = info.get("now") or ""
+    pages = max(1, (len(nodes) + CLASH_PAGE_SIZE - 1) // CLASH_PAGE_SIZE)
+    page = min(max(1, int(page or 1)), pages)
+    page_nodes = nodes[(page - 1) * CLASH_PAGE_SIZE:page * CLASH_PAGE_SIZE]
+
+    elements = []
+    for i in range(0, len(page_nodes), 2):
+        elements.append(_button_columns([
+            _callback_button(
+                node,
+                {"a": "n", "g": group, "n": node},
+                style="primary" if node == now else "default",
+            )
+            for node in page_nodes[i:i + 2]
+        ]))
+    nav = []
+    if page > 1:
+        nav.append(_callback_button("⬅️ 上一页", {"a": "p", "g": group, "p": page - 1}))
+    nav.append(_callback_button("↩️ 返回", {"a": "b"}))
+    if page < pages:
+        nav.append(_callback_button("下一页 ➡️", {"a": "p", "g": group, "p": page + 1}))
+    elements.append(_button_columns(nav))
+    subtitle = f"第 {page}/{pages} 页 · 当前:{now} · 共 {len(nodes)} 项"
+    return _clash_card(f"🔀 {group}", subtitle, elements)
+
+
+def build_clash_result_card(group, old_now, node, ok, detail=""):
+    """切换结果卡片:成功绿头/失败红头,附新旧节点与后续入口"""
+    if ok:
+        content = f"**{group}**\n`{old_now or '未知'}` → `{node}`"
+        template, icon = "green", "✅"
+    else:
+        content = f"**{group}**\n切换到 `{node}` 失败\n{detail}"
+        template, icon = "red", "❌"
+    elements = [
+        {"tag": "markdown", "content": content},
+        _button_columns([
+            _callback_button("↩️ 返回该组", {"a": "g", "g": group}),
+            _callback_button("🔀 策略组列表", {"a": "b"}),
+        ]),
+    ]
+    return _clash_card(f"{icon} Clash 节点切换", "", elements, template=template)
+
+
+def make_card_action_handler(config):
+    """卡片回传交互处理器:所有点击同步处理并返回新卡片(3 秒内),即点即更新"""
+
+    def respond(card=None, toast_type=None, toast_text=None):
+        payload = {}
+        if toast_type:
+            payload["toast"] = {"type": toast_type, "content": toast_text}
+        if card is not None:
+            payload["card"] = {"type": "raw", "data": card}
+        return P2CardActionTriggerResponse(payload)
+
+    def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        try:
+            event = data.event
+            operator = event.operator.open_id if event and event.operator else ""
+            owner = config.get("owner_open_id", "")
+            if not owner or operator != owner:
+                return respond(toast_type="error", toast_text="未授权,仅管理员可操作")
+            value = (event.action.value if event and event.action else None) or {}
+            action = value.get("a")
+            if action == "b":
+                return respond(card=build_clash_group_card())
+            if action == "g":
+                return respond(card=build_clash_node_card(value.get("g", ""), 1))
+            if action == "p":
+                return respond(card=build_clash_node_card(value.get("g", ""), int(value.get("p", 1))))
+            if action == "n":
+                group, node = value.get("g", ""), value.get("n", "")
+                old_now = ""
+                detail = ""
+                try:
+                    info = mihomo_get_proxies().get(group) or {}
+                    old_now = info.get("now") or ""
+                    mihomo_switch(group, node)
+                except Exception as error:
+                    detail = repr(error)
+                # 重读实际状态确认切换是否落定
+                confirmed = False
+                try:
+                    confirmed = (mihomo_get_proxies().get(group) or {}).get("now") == node
+                except Exception:
+                    pass
+                card = build_clash_result_card(group, old_now, node, confirmed, detail)
+                if confirmed:
+                    return respond(card=card, toast_type="success", toast_text=f"已切换到 {node}")
+                return respond(card=card, toast_type="error", toast_text="切换未生效,详见卡片")
+            return respond(toast_type="warning", toast_text="未知操作")
+        except Exception as error:  # 回调异常同样要在 3 秒内给出响应
+            return respond(toast_type="error", toast_text=f"处理失败:{error!r}"[:80])
+
+    return on_card_action
+
+
+def install_card_frame_patch():
+    """修补 lark-oapi 在长连接下丢弃 CARD 帧的问题。
+
+    ws/client.py 的 _handle_data_frame 对 MessageType.CARD 直接 return,导致
+    「卡片回传交互 card.action.trigger」注册的处理器永远不被调用(webhook
+    模式不受影响)。CARD 帧与 EVENT 帧结构一致、仅头部 type 不同,把 CARD
+    改写为 EVENT 即完整复用官方实现的派发与响应写回链路。升级 lark-oapi
+    后需复核该行为是否已在官方版本中修复。
+    """
+    from lark_oapi.ws.client import Client
+    from lark_oapi.ws.const import HEADER_TYPE
+
+    if getattr(Client, "_card_frame_patch_installed", False):
+        return
+    original = Client._handle_data_frame
+
+    async def patched(self, frame):
+        try:
+            for header in frame.headers:
+                if header.key == HEADER_TYPE and header.value == "card":
+                    header.value = "event"
+                    break
+        except Exception:
+            pass
+        return await original(self, frame)
+
+    Client._handle_data_frame = patched
+    Client._card_frame_patch_installed = True
 
 
 # ---------- 消息回复 ----------
@@ -473,6 +720,13 @@ def main():
                     reply_status_card(api_client, message.message_id)
                 except Exception as error:
                     build_reply(api_client, message.message_id, f"状态采集失败:{error!r}")
+            elif command in ("clash", "节点", "切换节点"):
+                try:
+                    card = build_clash_group_card()
+                    if not _reply(api_client, message.message_id, card, "interactive"):
+                        build_reply(api_client, message.message_id, "卡片发送失败,请检查 Clash(mihomo)是否在运行。")
+                except Exception as error:
+                    build_reply(api_client, message.message_id, f"读取 Clash 状态失败:{error!r}")
             else:
                 output, returncode, elapsed = run_shell(command)
                 try:
@@ -482,11 +736,18 @@ def main():
         except Exception as error:  # 单条消息异常不中断长连接
             print(f"处理消息异常: {error!r}", file=sys.stderr, flush=True)
 
-    handler = (
-        lark.EventDispatcherHandler.builder("", "")
-        .register_p2_im_message_receive_v1(on_message)
-        .build()
-    )
+    builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
+    try:
+        builder = builder.register_p2_card_action_trigger(make_card_action_handler(config))
+    except AttributeError:
+        # 旧版 lark-oapi 没有卡片回调注册能力;降级为仅消息命令,不影响既有功能
+        print("当前 lark-oapi 不支持卡片回传交互,clash 卡片按钮将不可用", file=sys.stderr, flush=True)
+    handler = builder.build()
+    # 长连接下 lark-oapi 1.7.x 会静默丢弃 CARD 帧,打补丁后卡片回传交互才能到达
+    try:
+        install_card_frame_patch()
+    except Exception as error:
+        print(f"卡片帧补丁安装失败,卡片回传交互不可用:{error!r}", file=sys.stderr, flush=True)
     ws_client = lark.ws.Client(
         config["app_id"],
         config["app_secret"],
