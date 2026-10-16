@@ -11,9 +11,13 @@ status 命令直接读容器自身的 cgroup 与 /proc 数据(free/uptime 读到
 代码块回显。clash 命令回复交互卡片:两级选择策略组与节点,点击即切换
 (mihomo 控制 API 127.0.0.1:9090),卡片回传交互经长连接接收。provider 与
 model 命令回复下拉选择卡片,抽屉里选中即把 codex 与 codex1~codex9 全部切到所选
-供应商或模型(cc-connect 管理接口 127.0.0.1:9820)。另有后台线程每分钟拉取 GitHub
-部署仓库(OPS_REPO)的清单,版本变化时自动下载校验并应用,构成零浏览器额度的
-自动部署通道。
+供应商或模型(cc-connect 管理接口 127.0.0.1:9820);同时支持与 cc-connect 自带
+体验一致的文本指令:/provider list|switch|current|repair|diag、/model
+list|switch|current。cc-connect 自带的 /provider switch 会把所选供应商记进会话,
+之后心跳(每 30 分钟唤醒会话)一到就会用旧记录把供应商改回去,故切换前会清理这类
+残留(必要时重启 cc-connect),切换后自动触发一次心跳做端到端自检。另有后台线程
+每分钟拉取 GitHub 部署仓库(OPS_REPO)的清单,版本变化时自动下载校验并应用,
+构成零浏览器额度的自动部署通道。
 """
 import hashlib
 import json
@@ -419,6 +423,8 @@ def build_clash_result_card(group, old_now, node, ok, detail=""):
 # (lark-oapi 的 CallBackAction.option),故选项 value 里带上类型前缀便于分派。
 # 十台逐个切换远超卡片回调的 3 秒窗口,故回调只回"正在切换"卡片与提示,实际切换
 # 放后台线程,完成后把结果卡片回复到原消息。
+# 供应商切换另带「心跳回切」修复与心跳自检(`/provider repair`、`/provider diag`
+# 可手动触发),原因与做法见下方「心跳回切修复」小节。
 
 CC_CONFIG_PATH = Path(os.environ.get("CC_CONNECT_CONFIG") or "/workspace/cc-connect/config.toml")
 CC_API_FALLBACK_PORT = 9820  # 配置里没写端口时的默认值(与 cc-connect 一致)
@@ -540,6 +546,491 @@ def cc_switch_all(kind, value):
     return results
 
 
+# ---------- 「心跳回切」修复:清掉会话里的旧 Provider 记录 ----------
+# cc-connect 自带的 /provider switch 会把所选 Provider 记进**该会话**(内存与会话
+# 文件);此后会话每次重新 start 都会经 restoreActiveProviderFromSession 用这条记录
+# 覆盖 agent 的当前 Provider。管家机器人走管理接口 activate,只改 agent 与
+# config.toml,不碰会话记录,于是心跳(默认每 30 分钟唤醒一次会话)一跑就把
+# Provider 改回旧记录值(2026-10-16 实测:切完就变回 anyrouter3,十台皆然)。
+# 修复 = 清掉会话文件里的 active_provider 字段 + 重启 cc-connect 让内存里的同一条
+# 记录一并消失。顺序必须是先停进程再清文件:cc-connect 退出时会保存会话,先清会被
+# 它写回;它保存走原子写(临时文件 + rename),SIGTERM 即可,不必硬杀。管理接口的
+# /api/v1/restart 不能用——那条路径同样会保存会话。清完后自动触发一次心跳做端到端
+# 自检(心跳正是回切的发生路径),被改回则再修一轮后复验。
+
+CC_DATA_DIR_FALLBACK = "/workspace/cc-connect/data"  # 配置未写 data_dir 时的默认值
+CC_CANARY_PROJECT = "codex"  # 自检项目:心跳同样每 30 分钟一次,项目名最短
+CC_CANARY_WAIT = 45  # 秒:触发心跳后等待其执行完成的上限
+CC_CANARY_POLL = 3  # 秒:自检期轮询心跳状态的间隔
+
+
+def cc_data_dir():
+    """从 cc-connect 配置解析 data_dir(会话文件位于其 sessions 子目录)"""
+    try:
+        text = CC_CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return CC_DATA_DIR_FALLBACK
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            break  # data_dir 是顶层键,进入第一个段后不再寻找
+        if stripped.startswith("data_dir") and "=" in stripped:
+            value = stripped.partition("=")[2].split("#")[0].strip().strip('"').strip("'")
+            if value:
+                return value
+    return CC_DATA_DIR_FALLBACK
+
+
+def cc_session_files():
+    """会话文件清单:data/sessions/*.json 与旧版 <data_dir>/<项目>[.sessions].json"""
+    data_dir = Path(cc_data_dir())
+    files = []
+    sessions_dir = data_dir / "sessions"
+    if sessions_dir.is_dir():
+        files.extend(sorted(sessions_dir.glob("*.json")))
+    for project in CC_PROJECTS:
+        for name in (f"{project}.json", f"{project}.sessions.json"):
+            legacy = data_dir / name
+            if legacy.is_file():
+                files.append(legacy)
+    return files
+
+
+def cc_session_provider_records(apply_changes):
+    """扫描或清除会话文件里的 active_provider 记录。
+
+    会话文件形如 {sessions: {会话ID: {…, active_provider: "名字"}}};顶层同名
+    字段属老格式,一并处理。apply_changes=False 只统计不落盘;True 时逐文件
+    原子写回,单个文件失败不影响其余文件。返回 (涉及文件数, 记录条数, 失败明细)。
+    """
+    hit_files = 0
+    hit_fields = 0
+    failures = []
+    for path in cc_session_files():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            failures.append(f"{path.name}({error})")
+            continue
+        if not isinstance(data, dict):
+            continue
+        found = 0
+        if "active_provider" in data:
+            found += 1
+            if apply_changes:
+                data.pop("active_provider")
+        sessions = data.get("sessions")
+        if isinstance(sessions, dict):
+            for session in sessions.values():
+                if isinstance(session, dict) and "active_provider" in session:
+                    found += 1
+                    if apply_changes:
+                        session.pop("active_provider")
+        if not found:
+            continue
+        if apply_changes:
+            try:
+                tmp = path.with_name(path.name + ".scrub")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as error:
+                failures.append(f"{path.name}(写入失败:{error})")
+                continue
+        hit_files += 1
+        hit_fields += found
+    return hit_files, hit_fields, failures
+
+
+def cc_residue_count():
+    """会话文件里的旧 Provider 记录条数(读失败按 0 计,不阻断切换)"""
+    try:
+        _, fields_hit, _ = cc_session_provider_records(apply_changes=False)
+        return fields_hit
+    except Exception:
+        return 0
+
+
+def _cc_pids():
+    """cc-connect 主进程 PID 列表(锚定二进制路径,与 start-all.sh 看门狗同款)"""
+    pattern = "^" + str(CC_CONFIG_PATH.parent / "cc-connect")
+    output, _, _ = run_shell(f"pgrep -f '{pattern}'", timeout=10)
+    return [line.strip() for line in output.splitlines() if line.strip().isdigit()]
+
+
+def _wait(predicate, seconds, interval=1.0):
+    """轮询等待谓词为真;返回是否在时限内为真(超时前再判一次终值)"""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _cc_api_ready():
+    """管理接口对 codex 项目可用(重启后读写都成功才算就绪)"""
+    try:
+        cc_list_providers(CC_CANARY_PROJECT)
+        cc_list_models(CC_CANARY_PROJECT)
+        return True
+    except Exception:
+        return False
+
+
+def cc_repair_provider_state(reason):
+    """清会话残留 + 重启 cc-connect;返回 (是否成功, 说明行列表)。
+
+    停机走 SIGTERM(cc-connect 收到后会原子保存会话再退出),等它真正退出后
+    清文件,再由 start-all.sh 的看门狗(约 10 秒)拉起;看门狗没在跑时补跑
+    start-all.sh(幂等)。存在 .stop(手动停机标记)时不动进程,直接放弃。
+    """
+    cc_dir = CC_CONFIG_PATH.parent
+    lines = [f"🛠 修复「心跳回切」:{reason}"]
+    if (cc_dir / ".stop").exists():
+        return False, lines + [f"❌ 存在手动停机标记 {cc_dir / '.stop'},未重启;删除它后重试"]
+    pids = _cc_pids()
+    if pids:
+        lines.append(f"1️⃣ 停止 cc-connect({len(pids)} 个进程,最多等 20 秒)…")
+        run_shell("kill -TERM " + " ".join(pids), timeout=15)
+        if not _wait(lambda: not _cc_pids(), 20):
+            run_shell("kill -9 " + " ".join(_cc_pids()), timeout=15)
+            if not _wait(lambda: not _cc_pids(), 8):
+                return False, lines + ["❌ cc-connect 未能停止,已放弃(下次切换会再试)"]
+    else:
+        lines.append("1️⃣ cc-connect 当前未运行,跳过停止")
+    files_hit, fields_hit, failures = cc_session_provider_records(apply_changes=True)
+    lines.append(f"2️⃣ 清除会话残留:{fields_hit} 条旧 Provider 记录(涉及 {files_hit} 个文件)")
+    if failures:
+        lines.append("⚠️ 未能处理:" + ";".join(failures[:3]))
+    if not _wait(lambda: bool(_cc_pids()), 45):
+        run_shell(f"bash {cc_dir / 'start-all.sh'}", timeout=30)
+        if not _wait(lambda: bool(_cc_pids()), 30):
+            return False, lines + ["❌ cc-connect 未被拉起,请用状态命令检查"]
+    lines.append("3️⃣ cc-connect 已被看门狗拉起")
+    if not _wait(_cc_api_ready, 30, interval=2):
+        return False, lines + ["❌ 进程已起但管理接口未就绪,稍后用 /provider current 复查"]
+    lines.append("4️⃣ 管理接口就绪")
+    return True, lines
+
+
+def cc_repair_if_needed(force=False):
+    """provider 切换前的残留检查,以及 /provider repair 的强制修复。
+
+    有残留或 force 时执行完整修复;没有残留时不做任何破坏性动作(不重启),
+    只回一行检查结论。返回给结果卡片追加的说明行。
+    """
+    try:
+        files_hit, fields_hit, failures = cc_session_provider_records(apply_changes=False)
+    except Exception as error:
+        return [f"⚠️ 会话残留检查失败:{error}"]
+    if not fields_hit and not force:
+        return ["🩺 会话残留检查:无旧 Provider 记录,心跳不会把 Provider 改回去"]
+    reason = "手动修复" if force else f"发现 {fields_hit} 条旧 Provider 记录(涉及 {files_hit} 个会话文件)"
+    _, lines = cc_repair_provider_state(reason)
+    if failures:
+        lines.append("⚠️ 未能处理:" + ";".join(failures[:3]))
+    return lines
+
+
+def cc_heartbeat_status(project):
+    """读某项目的心跳调度状态(run_count / skipped_busy / last_run 等)"""
+    return cc_api(
+        "GET",
+        f"/api/v1/projects/{cc_project_path(project)}/heartbeat",
+        timeout=CC_LIST_TIMEOUT,
+    )
+
+
+def cc_heartbeat_canary(expected=None):
+    """触发一次心跳,验证 Provider 不会被会话里的旧记录改回。
+
+    心跳正是「切完又变回去」的发生路径(会话重新 start 时用旧记录覆盖
+    agent),故主动触发一次并对比前后的 active_provider。返回 (状态, 说明):
+    True 已实测未被改回、False 被改回、None 无法确认(接口异常/会话忙等)。
+    """
+    project = CC_CANARY_PROJECT
+    base = f"/api/v1/projects/{cc_project_path(project)}"
+    try:
+        _, before = cc_list_providers(project)
+        status = cc_heartbeat_status(project)
+    except Exception as error:
+        return None, f"读取 {project} 心跳状态失败:{error}"
+    if not before:
+        return None, f"{project} 未返回当前 Provider,无法自检"
+    if expected and before != expected:
+        return False, f"自检前 {project} 的 Provider 已是 `{before}`,不是刚切换的 `{expected}`"
+    runs_before = int(status.get("run_count") or 0)
+    skipped_before = int(status.get("skipped_busy") or 0)
+    try:
+        cc_api("POST", f"{base}/heartbeat/run", timeout=10)
+    except Exception as error:
+        return None, f"触发心跳失败:{error}"
+    ran = False
+    skipped = False
+    deadline = time.monotonic() + CC_CANARY_WAIT
+    while time.monotonic() < deadline:
+        time.sleep(CC_CANARY_POLL)
+        try:
+            status = cc_heartbeat_status(project)
+        except Exception:
+            continue
+        if int(status.get("skipped_busy") or 0) > skipped_before:
+            skipped = True
+            break
+        if int(status.get("run_count") or 0) > runs_before:
+            ran = True
+            break
+    try:
+        _, after = cc_list_providers(project)
+    except Exception as error:
+        return None, f"心跳后读取 Provider 失败:{error}"
+    if after != before:
+        return False, f"心跳后 {project} 的 Provider 从 `{before}` 变成了 `{after}`"
+    if ran:
+        return True, f"已实测一次心跳(项目 {project}),Provider 仍是 `{before}` 未被改回"
+    if skipped:
+        return None, f"会话正忙,心跳被跳过,本次未能实测(当前仍为 `{before}`)"
+    return None, f"触发心跳后 {CC_CANARY_WAIT} 秒内未见执行(当前仍为 `{before}`)"
+
+
+def cc_verify_provider_sticky(expected):
+    """provider 切换后的端到端自检:触发心跳确认不会被改回。
+
+    被改回说明仍有残留(例如只存在于内存里的记录),自动再修一轮(重启 +
+    清文件)、重新切换并复验;返回给用户的说明行列表。
+    """
+    state, text = cc_heartbeat_canary(expected)
+    if state is True:
+        return [f"✅ {text}"]
+    if state is None:
+        return [f"ℹ️ {text}"]
+    lines = [f"⚠️ {text};仍有残留,正在再修复一轮…"]
+    ok, repair_lines = cc_repair_provider_state("心跳自检发现 Provider 仍被改回")
+    lines += repair_lines
+    if not ok:
+        return lines + ["❌ 修复未完成,请稍后再发 /provider repair"]
+    results = cc_switch_all("provider", expected)
+    failed = [project for project, success, _ in results if not success]
+    lines.append(f"已重新统一切到 `{expected}`" + (f",失败:{', '.join(failed)}" if failed else ""))
+    state, text = cc_heartbeat_canary(expected)
+    lines.append(("✅ " if state is True else "⚠️ " if state is False else "ℹ️ ") + text)
+    return lines
+
+
+# ---------- provider / model 的文本指令(对齐 cc-connect 自带体验) ----------
+# cc-connect 自带 /provider、/model 的文本用法:list 清单(当前项用 ▶ / > 标出)、
+# switch <名称|序号> 切换、current 当前值;文案逐条对齐上游中文串。管家机器人覆盖
+# 十台项目,清单以 codex 项目为来源(十台配置同源),当前值汇总十台展示。另加两项
+# 管家特有命令:repair(清残留 + 重启)与 diag(体检)。任何 provider/model 开头的
+# 命令都走这里,绝不再落到 shell 执行。
+
+CC_USAGE_PROVIDER = (
+    "用法:`/provider list` 查看全部,`/provider switch <名称>` 切换,"
+    "`/provider current` 看当前值,`/provider repair` 修复心跳回切,`/provider diag` 体检。"
+)
+CC_USAGE_MODEL = (
+    "用法: `/model list` 查看全部,`/model switch <序号>` 或 `/model switch <模型名>` 切换,"
+    "也可直接发 `/model <模型名>`。"
+)
+
+
+def cc_provider_list_text():
+    """`/provider list` 文本清单;行格式与文案对齐 cc-connect 自带实现"""
+    project = cc_probe_project()
+    providers, active = cc_list_providers(project)
+    if not providers:
+        return "未配置 Provider。"
+    lines = ["📡 Provider 列表", ""]
+    for item in providers:
+        name = item.get("name") or ""
+        detail = name
+        if item.get("base_url"):
+            detail += f" ({item['base_url']})"
+        if item.get("model"):
+            detail += f" [{item['model']}]"
+        lines.append(("▶ " if name == active else "  ") + detail)
+    lines += ["", "`/provider switch <名称>` 切换"]
+    return "\n".join(lines)
+
+
+def cc_model_list_text():
+    """`/model list` 文本清单;行格式与文案对齐 cc-connect 自带实现"""
+    project = cc_probe_project()
+    models, current = cc_list_models(project)
+    if not models:
+        return "未取得可用模型列表。"
+    lines = [
+        f"当前模型: {current}" if current else "当前模型: (未设置,使用 Agent 默认值)",
+        "",
+        "可用模型:",
+    ]
+    for index, name in enumerate(models, 1):
+        lines.append(("> " if name == current else "  ") + f"{index}. {name}")
+    lines += ["", CC_USAGE_MODEL]
+    return "\n".join(lines)
+
+
+def cc_current_text(kind):
+    """`/provider current`、`/model current`:汇总十台当前值,不一致时逐台列出"""
+    values = {}
+    for project in CC_PROJECTS:
+        try:
+            _, value = cc_list_providers(project) if kind == "provider" else cc_list_models(project)
+            values[project] = value or "(未设置)"
+        except Exception as error:
+            values[project] = f"(读取失败:{str(error)[:60]})"
+    title = "📡 当前 Provider" if kind == "provider" else "🧠 当前模型"
+    groups = {}
+    for project, value in values.items():
+        groups.setdefault(value, []).append(project)
+    if len(groups) == 1:
+        value = next(iter(groups))
+        return f"{title}\n\n**{value}** — codex 及 codex1~codex9 共 {len(CC_PROJECTS)} 台一致"
+    lines = [title, ""]
+    for value, projects in groups.items():
+        lines.append(f"`{value}` — {', '.join(projects)}")
+    return "\n".join(lines)
+
+
+def cc_diag_text():
+    """`/provider diag`:会话残留 + 十台当前 Provider 的体检报告"""
+    files_hit, fields_hit, failures = cc_session_provider_records(apply_changes=False)
+    lines = ["🩺 心跳回切体检", ""]
+    if fields_hit:
+        lines.append(
+            f"⚠️ 会话文件里有 {fields_hit} 条旧 Provider 记录(涉及 {files_hit} 个文件):"
+            "下次心跳或新会话就会把 Provider 改回记录值,发 /provider repair 清除。"
+        )
+    else:
+        lines.append("✅ 会话文件无旧 Provider 记录(心跳不会改回旧值)。")
+    if failures:
+        lines.append("⚠️ 无法解析:" + ";".join(failures[:3]))
+    lines += ["", cc_current_text("provider")]
+    return "\n".join(lines)
+
+
+def cc_resolve_provider_arg(argument):
+    """把 provider 参数解析为已存在的 Provider 名(大小写不敏感);不存在返回 None"""
+    providers, _ = cc_list_providers(cc_probe_project())
+    if argument in [item.get("name") for item in providers]:
+        return argument
+    for item in providers:
+        if (item.get("name") or "").lower() == argument.lower():
+            return item.get("name")
+    return None
+
+
+def cc_resolve_model_arg(argument):
+    """把 model 参数(1 起序号或模型名)解析为模型名;解析不了返回 None"""
+    models, _ = cc_list_models(cc_probe_project())
+    if argument.isdigit():
+        index = int(argument)
+        return models[index - 1] if 1 <= index <= len(models) else None
+    for name in models:
+        if name.lower() == argument.lower():
+            return name
+    return None
+
+
+def start_cc_switch_with_notice(api_client, message_id, kind, value):
+    """文本指令入口:先起后台批量切换,再回一条进行中提示(结果单独回卡片)"""
+    if not start_cc_switch(api_client, message_id, kind, value):
+        build_reply(api_client, message_id, "已有切换任务在进行中,请稍候。")
+        return
+    label = "Provider" if kind == "provider" else "模型"
+    lines = [f"⏳ 正在把 codex 及 codex1~codex9 共 {len(CC_PROJECTS)} 台统一切到{label} `{value}`…"]
+    if kind == "provider":
+        residue = cc_residue_count()
+        if residue:
+            lines.append(f"🛠 检测到 {residue} 条会话残留,会先清理并重启 cc-connect(约 1 分钟)再切换。")
+        lines.append("完成后回复结果卡片,并自动触发一次心跳自检(约半分钟)。")
+    build_reply(api_client, message_id, "\n".join(lines))
+
+
+def start_cc_repair(api_client, message_id, args):
+    """`/provider repair [名称]`:清残留 + 重启 cc-connect,随后统一切到目标
+
+    缺省沿用当前 Provider(修复本身不改选择)。
+    """
+    if args:
+        target = cc_resolve_provider_arg(args[0])
+        if target is None:
+            build_reply(api_client, message_id, f'❌ 未找到 Provider "{args[0]}"。使用 `/provider list` 查看可用列表。')
+            return
+    else:
+        _, target = cc_list_providers(cc_probe_project())
+        if not target:
+            build_reply(api_client, message_id, "未能确定当前 Provider,请改用 `/provider switch <名称>`。")
+            return
+    if not start_cc_switch(api_client, message_id, "provider", target, force_repair=True):
+        build_reply(api_client, message_id, "已有切换任务在进行中,请稍候。")
+        return
+    build_reply(api_client, message_id, (
+        f"🛠 开始修复「心跳回切」:清理会话残留并重启 cc-connect(约 1 分钟),"
+        f"随后把 10 台统一切到 `{target}`;完成后回复结果卡片并做心跳自检。"
+    ))
+
+
+def handle_cc_text_command(api_client, message_id, kind, args):
+    """provider / model 文本指令入口(不带参数时回下拉卡片)。
+
+    语义与文案对齐 cc-connect 自带的 /provider、/model:list / switch /
+    current,外加管家特有的 repair、diag;`/provider <名称>` 视为 switch 的
+    便捷写法。未知子命令只回用法说明,不会落到 shell 执行。
+    """
+    label = "Provider" if kind == "provider" else "模型"
+    usage = CC_USAGE_PROVIDER if kind == "provider" else CC_USAGE_MODEL
+    if not args:
+        try:
+            card = build_cc_provider_card() if kind == "provider" else build_cc_model_card()
+            if not _reply(api_client, message_id, card, "interactive"):
+                build_reply(api_client, message_id, "卡片发送失败。")
+        except Exception as error:
+            build_reply(api_client, message_id, f"读取{label}列表失败:{error!r}")
+        return
+    sub = args[0].lower()
+    try:
+        if sub in ("list", "列表"):
+            text = cc_provider_list_text() if kind == "provider" else cc_model_list_text()
+            build_reply(api_client, message_id, text)
+            return
+        if sub in ("current", "当前"):
+            build_reply(api_client, message_id, cc_current_text(kind))
+            return
+        if kind == "provider" and sub in ("repair", "修复", "fix"):
+            start_cc_repair(api_client, message_id, args[1:])
+            return
+        if kind == "provider" and sub in ("diag", "诊断", "体检"):
+            build_reply(api_client, message_id, cc_diag_text())
+            return
+        if sub in ("switch", "切换"):
+            if len(args) < 2:
+                # 上游缺参时的原文案就是这句英文
+                build_reply(api_client, message_id, "Usage: /provider switch <name>" if kind == "provider" else CC_USAGE_MODEL)
+                return
+            target = args[1]
+        elif sub in ("add", "remove", "rm", "delete", "clear", "reset", "none",
+                     "新增", "删除", "清除", "重置"):
+            # 上游还有这些子命令,管家机器人只做批量切换,不支持改动配置
+            build_reply(api_client, message_id, usage)
+            return
+        else:
+            target = args[0]
+        if kind == "provider":
+            name = cc_resolve_provider_arg(target)
+            if name is None:
+                build_reply(api_client, message_id, f'❌ 未找到 Provider "{target}"。使用 `/provider list` 查看可用列表。')
+                return
+        else:
+            name = cc_resolve_model_arg(target)
+            if name is None:
+                build_reply(api_client, message_id, f'❌ 未找到模型 "{target}"。使用 `/model list` 查看可用列表。')
+                return
+        start_cc_switch_with_notice(api_client, message_id, kind, name)
+    except Exception as error:
+        build_reply(api_client, message_id, f"处理失败:{error!r}")
+
+
 def _cc_select(kind, items, current):
     """供应商/模型的下拉选择组件(卡片 2.0 的 select_static)。
 
@@ -608,24 +1099,40 @@ def build_cc_model_card():
     )
 
 
-def build_cc_switching_card(kind, value):
-    """点击候选项后立即返回的等待卡片;真正的结果由后台线程回复"""
+def build_cc_switching_card(kind, value, residue=0):
+    """点击候选项后立即返回的等待卡片;真正的结果由后台线程回复。
+
+    residue 为点击瞬间扫到的旧 Provider 记录条数(仅 provider 切换会带上):
+    大于 0 时卡片会预告清理与重启,免得用户觉得切换卡住了。
+    """
     label = "供应商" if kind == "provider" else "模型"
     elements = [
         {"tag": "markdown", "content": (
             f"正在把 **codex 及 codex1~codex9 共 {len(CC_PROJECTS)} 个项目**统一切到{label} `{value}`,"
             "完成后会回复一条结果卡片。"
         )},
-        _button_columns([
-            _callback_button("🔌 供应商列表", {"a": "cp"}),
-            _callback_button("🧠 模型列表", {"a": "cm"}),
-        ]),
     ]
+    if kind == "provider":
+        if residue:
+            elements.append({"tag": "markdown", "content": (
+                f"🛠 检测到 **{residue} 条旧 Provider 记录**(心跳会用它把 Provider 改回去):"
+                "先清理并重启 cc-connect(约 1 分钟)再切换,重启期间的会话可能被打断。"
+            )})
+        elements.append({"tag": "markdown", "content": (
+            "切换完成后自动触发一次心跳自检(约 30 秒),确认 Provider 不会被改回。"
+        )})
+    elements.append(_button_columns([
+        _callback_button("🔌 供应商列表", {"a": "cp"}),
+        _callback_button("🧠 模型列表", {"a": "cm"}),
+    ]))
     return _clash_card(f"⏳ 正在切换{label}:{value}", "", elements, template="orange")
 
 
-def build_cc_result_card(kind, value, results):
-    """批量切换结果卡片:逐台列出成功/失败,全成功绿头、部分成功橙头、全失败红头"""
+def build_cc_result_card(kind, value, results, notes=()):
+    """批量切换结果卡片:逐台列出成功/失败,全成功绿头、部分成功橙头、全失败红头
+
+    notes 为修复检查等附注行(例如清掉了多少条会话残留),插在逐台结果之前。
+    """
     label = "供应商" if kind == "provider" else "模型"
     succeeded = sum(1 for _, ok, _ in results if ok)
     lines = [f"**{label} `{value}`** — 成功 {succeeded}/{len(results)}"]
@@ -637,8 +1144,9 @@ def build_cc_result_card(kind, value, results):
         template, icon = "red", "❌"
     else:
         template, icon = "orange", "⚠️"
+    blocks = ["\n".join(notes), "\n".join(lines)] if notes else ["\n".join(lines)]
     elements = [
-        {"tag": "markdown", "content": "\n".join(lines)},
+        {"tag": "markdown", "content": "\n\n".join(blocks)},
         _button_columns([
             _callback_button("🔌 供应商列表", {"a": "cp"}),
             _callback_button("🧠 模型列表", {"a": "cm"}),
@@ -647,29 +1155,40 @@ def build_cc_result_card(kind, value, results):
     return _clash_card(f"{icon} {label}切换结果", "", elements, template=template)
 
 
-def start_cc_switch(api_client, message_id, kind, value):
+def start_cc_switch(api_client, message_id, kind, value, force_repair=False):
     """后台执行批量切换并把结果回复到原消息;已有任务在跑时返回 False。
 
     卡片回调必须在 3 秒内响应,十台切换做不到,故回调只负责起线程。
+    provider 切换先做「心跳回切」残留检查(有残留或 force_repair 时重启
+    cc-connect 清理),切换完成后再触发一次心跳自检,结论作为第二条消息回复;
+    整段流程都在切换锁内,同一时刻只有一次批量任务。
     """
     if not cc_switch_lock.acquire(blocking=False):
         return False
 
     def run():
         try:
+            notes = cc_repair_if_needed(force=force_repair) if kind == "provider" else []
             results = cc_switch_all(kind, value)
             label = "供应商" if kind == "provider" else "模型"
             if api_client is None or not message_id:
                 print(f"{label}批量切换完成:{results}", file=sys.stderr, flush=True)
                 return
-            card = build_cc_result_card(kind, value, results)
+            card = build_cc_result_card(kind, value, results, notes)
             if not _reply(api_client, message_id, card, "interactive"):
-                lines = [f"{label} {value}:"]
+                lines = [f"{label} {value}:", *notes]
                 lines += [
                     f"{'成功' if ok else '失败'} {project}{(' — ' + detail) if detail else ''}"
                     for project, ok, detail in results
                 ]
                 build_reply(api_client, message_id, "\n".join(lines))
+            if kind == "provider":
+                verdict = (
+                    cc_verify_provider_sticky(value)
+                    if all(ok for _, ok, _ in results)
+                    else ["⚠️ 有项目切换失败,跳过心跳自检"]
+                )
+                build_reply(api_client, message_id, "🩺 心跳自检\n" + "\n".join(verdict))
         except Exception as error:  # 后台线程异常必须自行兜住,否则静默丢结果
             print(f"批量切换异常: {error!r}", file=sys.stderr, flush=True)
             if api_client is not None and message_id:
@@ -709,11 +1228,12 @@ def make_card_action_handler(config, api_client=None):
                     return respond(toast_type="warning", toast_text="无法识别的选项")
                 context = getattr(event, "context", None)
                 message_id = getattr(context, "open_message_id", "") or ""
+                residue = cc_residue_count() if kind == "provider" else 0
                 if not start_cc_switch(api_client, message_id, kind, target):
                     return respond(toast_type="warning", toast_text="已有切换任务在进行中,请稍候")
                 label = "供应商" if kind == "provider" else "模型"
                 return respond(
-                    card=build_cc_switching_card(kind, target),
+                    card=build_cc_switching_card(kind, target, residue),
                     toast_type="info",
                     toast_text=f"开始切换{label}:{target}",
                 )
@@ -901,6 +1421,26 @@ def normalize_command(raw_text):
     return re.sub(r"@_user_\d+", "", raw_text).strip()
 
 
+def route_command(command):
+    """命令路由:返回 (路由, 载荷)。
+
+    路由为 "status" / "clash" / "cc"(载荷 = (kind, args)) / "shell"(载荷 =
+    原命令)。provider 与 model 开头的命令一律进文本指令分支,绝不再落到 shell
+    执行(此前 `/provider list` 会被当 shell 命令跑,语义完全不对)。
+    """
+    tokens = command.split()
+    head = tokens[0].lstrip("/").lower() if tokens else ""
+    if head in ("provider", "providers", "供应商"):
+        return "cc", ("provider", tokens[1:])
+    if head in ("model", "models", "模型"):
+        return "cc", ("model", tokens[1:])
+    if command in ("status", "状态"):
+        return "status", None
+    if command in ("clash", "节点", "切换节点"):
+        return "clash", None
+    return "shell", command
+
+
 # ---------- 自动部署通道:容器每分钟主动拉取 GitHub 公开仓库的清单 ----------
 # workers.dev 域名在容器内因 DNS 污染不可达,"推"不进去;但容器出网正常,
 # 让 bot 自己轮询部署仓库(内容仅部署脚本,不含任何密钥),版本变化时自动
@@ -1017,35 +1557,25 @@ def main():
                 build_reply(api_client, message.message_id, "未授权。")
                 return
 
-            if command in ("status", "状态"):
+            route, payload = route_command(command)
+            if route == "status":
                 try:
                     reply_status_card(api_client, message.message_id)
                 except Exception as error:
                     build_reply(api_client, message.message_id, f"状态采集失败:{error!r}")
-            elif command in ("clash", "节点", "切换节点"):
+            elif route == "clash":
                 try:
                     card = build_clash_group_card()
                     if not _reply(api_client, message.message_id, card, "interactive"):
                         build_reply(api_client, message.message_id, "卡片发送失败,请检查 Clash(mihomo)是否在运行。")
                 except Exception as error:
                     build_reply(api_client, message.message_id, f"读取 Clash 状态失败:{error!r}")
-            # provider / model:列出候选项,点击后把 codex 及 codex1~codex9 一起切过去
-            elif command.lstrip("/").lower() in ("provider", "providers", "供应商"):
-                try:
-                    card = build_cc_provider_card()
-                    if not _reply(api_client, message.message_id, card, "interactive"):
-                        build_reply(api_client, message.message_id, "卡片发送失败。")
-                except Exception as error:
-                    build_reply(api_client, message.message_id, f"读取供应商列表失败:{error!r}")
-            elif command.lstrip("/").lower() in ("model", "models", "模型"):
-                try:
-                    card = build_cc_model_card()
-                    if not _reply(api_client, message.message_id, card, "interactive"):
-                        build_reply(api_client, message.message_id, "卡片发送失败。")
-                except Exception as error:
-                    build_reply(api_client, message.message_id, f"读取模型列表失败:{error!r}")
+            # provider / model:下拉卡片或文本指令,切换与修复都作用于 codex 及 codex1~codex9
+            elif route == "cc":
+                kind, args = payload
+                handle_cc_text_command(api_client, message.message_id, kind, args)
             else:
-                output, returncode, elapsed = run_shell(command)
+                output, returncode, elapsed = run_shell(payload)
                 try:
                     reply_exec_card(api_client, message.message_id, command, output, returncode, elapsed)
                 except Exception as error:
