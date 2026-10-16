@@ -1,11 +1,11 @@
 {
-  "version": 6,
+  "version": 7,
   "updated": "2026-10-16",
   "restart": "bot",
   "files": [
     {
       "path": "feishu-bot.py",
-      "sha256": "dbfa0d8c241e87ce39ddf9fff742a63867b765e3779a51a29a34187392814aff"
+      "sha256": "fa7db0562ad472f4a93369025883cf392cbca1579340a349a72eb39eec9f0f65"
     },
     {
       "path": "run-new-api.sh",

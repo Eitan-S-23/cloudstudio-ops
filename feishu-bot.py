@@ -9,9 +9,11 @@
 status 命令直接读容器自身的 cgroup 与 /proc 数据(free/uptime 读到的是宿主机
 数据,会误导),并以飞书卡片(fields 两列布局)回复;普通命令的输出以卡片
 代码块回显。clash 命令回复交互卡片:两级选择策略组与节点,点击即切换
-(mihomo 控制 API 127.0.0.1:9090),卡片回传交互经长连接接收。另有后台
-线程每分钟拉取 GitHub 部署仓库(OPS_REPO)的清单,版本变化时自动下载
-校验并应用,构成零浏览器额度的自动部署通道。
+(mihomo 控制 API 127.0.0.1:9090),卡片回传交互经长连接接收。provider 与
+model 命令回复候选项卡片,点击即把 codex 与 codex1~codex9 全部切到所选供应商
+或模型(cc-connect 管理接口 127.0.0.1:9820)。另有后台线程每分钟拉取 GitHub
+部署仓库(OPS_REPO)的清单,版本变化时自动下载校验并应用,构成零浏览器额度的
+自动部署通道。
 """
 import hashlib
 import json
@@ -21,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -297,7 +300,7 @@ def _button_columns(buttons):
 
 
 def _clash_card(title, subtitle, elements, template="blue"):
-    """clash 交互卡片统一外壳(2.0 结构);update_multi 让更新对所有接收者生效"""
+    """交互卡片统一外壳(2.0 结构),Clash 与 cc-connect 卡片共用;update_multi 让更新对所有接收者生效"""
     header = {"template": template, "title": {"tag": "plain_text", "content": title}}
     if subtitle:
         header["subtitle"] = {"tag": "plain_text", "content": subtitle}
@@ -400,7 +403,308 @@ def build_clash_result_card(group, old_now, node, ok, detail=""):
     return _clash_card(f"{icon} Clash 节点切换", "", elements, template=template)
 
 
-def make_card_action_handler(config):
+# ---------- cc-connect 供应商 / 模型一键切换 ----------
+# 容器内的 cc-connect 已启用官方管理接口(配置 [management] enabled = true,
+# 默认监听 127.0.0.1:9820),机器人就在容器内,可直接调用它完成供应商与模型的
+# 切换;交互形态对齐 cc-connect 自带的 /provider、/model:列出候选项 → 点击即
+# 生效 → 回报"已切换为 X"。区别是本机器人会把 codex 与 codex1…codex9 十个项目
+# 一次性切到同一项。
+#   GET  /api/v1/projects/{name}/providers → {providers:[{name,active,model,…}], active_provider}
+#   POST /api/v1/projects/{name}/providers/{provider}/activate
+#   GET  /api/v1/projects/{name}/models    → {models:[…], current}
+#   POST /api/v1/projects/{name}/model     body {"model": "…"}
+# 响应统一为 {"ok": true, "data": {…}},失败为 {"ok": false, "error": "…"}。
+# 十台逐个切换远超卡片回调的 3 秒窗口,故回调只回"正在切换"卡片与提示,实际切换
+# 放后台线程,完成后把结果卡片回复到原消息。
+
+CC_CONFIG_PATH = Path(os.environ.get("CC_CONNECT_CONFIG") or "/workspace/cc-connect/config.toml")
+CC_API_FALLBACK_PORT = 9820  # 配置里没写端口时的默认值(与 cc-connect 一致)
+CC_PROJECTS = ("codex",) + tuple(f"codex{i}" for i in range(1, 10))  # 一键切换覆盖的项目
+CC_PAGE_SIZE = 24  # 候选项每页条目数(2 列 x 12 行,与 Clash 节点卡片一致)
+CC_LIST_TIMEOUT = 3  # 点击列表必须 3 秒内响应,读取列表也限制在同一窗口内
+cc_switch_lock = threading.Lock()  # 同一时刻只允许一个批量切换任务
+# 显式绕开代理:管理接口就在本机回环地址上,而容器里常有 http_proxy/all_proxy
+# 之类的环境变量(clash 与 cc-connect 都在用代理),代理一旦不直连回环地址,
+# urlopen 就会把 127.0.0.1 的请求绕出去,表现为莫名的 502/超时。
+cc_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def cc_management_endpoint():
+    """从 cc-connect 配置里解析 [management] 段的端口与令牌。
+
+    容器内 Python 未必带 tomllib(3.11+ 才有),故按行解析:只认顶格
+    [management] 段内的键,避免误取其它段的同名键。令牌属敏感值,只在
+    内存中用于请求头,不写日志、不回显。
+    """
+    try:
+        text = CC_CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError as error:
+        raise RuntimeError(f"读取 cc-connect 配置失败:{CC_CONFIG_PATH}({error})") from error
+    port = CC_API_FALLBACK_PORT
+    token = ""
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = stripped == "[management]"
+            continue
+        if not in_section or "=" not in stripped:
+            continue
+        key, _, raw = stripped.partition("=")
+        value = raw.split("#")[0].strip().strip('"').strip("'")
+        if key.strip() == "port" and value.isdigit():
+            port = int(value)
+        elif key.strip() == "token":
+            token = value
+    if not token:
+        raise RuntimeError("cc-connect 未启用管理接口(配置 [management] 段缺少 token)")
+    return port, token
+
+
+def cc_api(method, path, payload=None, timeout=20):
+    """调用 cc-connect 官方管理接口,返回 data 段内容;任何失败抛异常"""
+    port, token = cc_management_endpoint()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with cc_opener.open(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace").strip()[:200]
+        raise RuntimeError(f"HTTP {error.code}:{detail}") from error
+    except OSError as error:  # 连接被拒/超时等网络错误
+        raise RuntimeError(f"管理接口不可达:{error}") from error
+    if not body.strip():
+        return {}
+    parsed = json.loads(body)
+    if parsed.get("ok") is False:
+        raise RuntimeError(str(parsed.get("error") or "管理接口返回失败")[:200])
+    data = parsed.get("data")
+    return data if isinstance(data, dict) else parsed
+
+
+def cc_project_path(project):
+    """项目名在 URL 路径里的安全形式(名称为数字字母,这里只做防御性转义)"""
+    return urllib.parse.quote(project, safe="")
+
+
+def cc_list_providers(project):
+    data = cc_api(
+        "GET", f"/api/v1/projects/{cc_project_path(project)}/providers", timeout=CC_LIST_TIMEOUT
+    )
+    return data.get("providers") or [], data.get("active_provider") or ""
+
+
+def cc_list_models(project):
+    data = cc_api(
+        "GET", f"/api/v1/projects/{cc_project_path(project)}/models", timeout=CC_LIST_TIMEOUT
+    )
+    return data.get("models") or [], data.get("current") or ""
+
+
+def cc_probe_project():
+    """挑一个能读到供应商列表的项目作为候选项来源(codex 优先),全失败则抛异常"""
+    last_error = None
+    for project in CC_PROJECTS:
+        try:
+            cc_list_providers(project)
+            return project
+        except Exception as error:
+            last_error = error
+    raise RuntimeError(f"cc-connect 管理接口不可用:{last_error}")
+
+
+def cc_switch_all(kind, value):
+    """把 codex 与 codex1…codex9 逐个切到指定供应商或模型。
+
+    顺序执行(cc-connect 每次切换都会重载对应项目),逐台返回结果供卡片如实
+    展示;单台失败不影响其余项目继续,避免一台的异常中断整批操作。
+    """
+    results = []
+    for project in CC_PROJECTS:
+        path = f"/api/v1/projects/{cc_project_path(project)}"
+        try:
+            if kind == "provider":
+                cc_api("POST", f"{path}/providers/{cc_project_path(value)}/activate")
+            else:
+                cc_api("POST", f"{path}/model", {"model": value})
+            results.append((project, True, ""))
+        except Exception as error:
+            results.append((project, False, str(error)[:160]))
+    return results
+
+
+def build_cc_provider_card(page=1):
+    """供应商列表卡片:一行一个供应商(附默认模型)与切换按钮,当前项高亮"""
+    project = cc_probe_project()
+    providers, active = cc_list_providers(project)
+    total = len(providers)
+    pages = max(1, (total + CC_PAGE_SIZE - 1) // CC_PAGE_SIZE)
+    page = min(max(1, int(page or 1)), pages)
+    elements = [{
+        "tag": "markdown",
+        "content": f"选中后将把 **codex 及 codex1~codex9 共 {len(CC_PROJECTS)} 个项目**统一切到该供应商。",
+    }]
+    for item in providers[(page - 1) * CC_PAGE_SIZE:page * CC_PAGE_SIZE]:
+        name = item.get("name") or ""
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 3,
+                    "vertical_align": "center",
+                    "elements": [{
+                        "tag": "markdown",
+                        "content": f"**{name}**\n{item.get('model') or '未设默认模型'}",
+                    }],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [_callback_button(
+                        "✅ 当前" if item.get("active") else "切换",
+                        {"a": "cv", "k": "provider", "n": name},
+                        style="primary" if item.get("active") else "default",
+                    )],
+                },
+            ],
+        })
+    if total == 0:
+        elements.append({"tag": "markdown", "content": "该项目未配置任何供应商。"})
+    nav = []
+    if page > 1:
+        nav.append(_callback_button("⬅️ 上一页", {"a": "cq", "k": "provider", "p": page - 1}))
+    nav.append(_callback_button("🔄 刷新", {"a": "cq", "k": "provider", "p": page}))
+    if page < pages:
+        nav.append(_callback_button("下一页 ➡️", {"a": "cq", "k": "provider", "p": page + 1}))
+    elements.append(_button_columns(nav))
+    return _clash_card(
+        "🔌 cc-connect 供应商切换",
+        f"来源:{project} · 当前:{active or '未知'} · 共 {total} 项(第 {page}/{pages} 页)",
+        elements,
+    )
+
+
+def build_cc_model_card(page=1):
+    """模型列表卡片:按钮网格,当前模型高亮,超过一页时分页"""
+    project = cc_probe_project()
+    models, current = cc_list_models(project)
+    total = len(models)
+    pages = max(1, (total + CC_PAGE_SIZE - 1) // CC_PAGE_SIZE)
+    page = min(max(1, int(page or 1)), pages)
+    window = models[(page - 1) * CC_PAGE_SIZE:page * CC_PAGE_SIZE]
+    elements = [{
+        "tag": "markdown",
+        "content": f"选中后将把 **codex 及 codex1~codex9 共 {len(CC_PROJECTS)} 个项目**统一切到该模型。",
+    }]
+    for i in range(0, len(window), 2):
+        elements.append(_button_columns([
+            _callback_button(
+                model,
+                {"a": "cv", "k": "model", "n": model},
+                style="primary" if model == current else "default",
+            )
+            for model in window[i:i + 2]
+        ]))
+    if total == 0:
+        elements.append({"tag": "markdown", "content": "未取得可用模型列表。"})
+    nav = []
+    if page > 1:
+        nav.append(_callback_button("⬅️ 上一页", {"a": "cq", "k": "model", "p": page - 1}))
+    nav.append(_callback_button("🔄 刷新", {"a": "cq", "k": "model", "p": page}))
+    if page < pages:
+        nav.append(_callback_button("下一页 ➡️", {"a": "cq", "k": "model", "p": page + 1}))
+    elements.append(_button_columns(nav))
+    return _clash_card(
+        "🧠 cc-connect 模型切换",
+        f"来源:{project} · 当前:{current or '未知'} · 共 {total} 项(第 {page}/{pages} 页)",
+        elements,
+    )
+
+
+def build_cc_switching_card(kind, value):
+    """点击候选项后立即返回的等待卡片;真正的结果由后台线程回复"""
+    label = "供应商" if kind == "provider" else "模型"
+    elements = [
+        {"tag": "markdown", "content": (
+            f"正在把 **codex 及 codex1~codex9 共 {len(CC_PROJECTS)} 个项目**统一切到{label} `{value}`,"
+            "完成后会回复一条结果卡片。"
+        )},
+        _button_columns([
+            _callback_button("🔌 供应商列表", {"a": "cp"}),
+            _callback_button("🧠 模型列表", {"a": "cm"}),
+        ]),
+    ]
+    return _clash_card(f"⏳ 正在切换{label}:{value}", "", elements, template="orange")
+
+
+def build_cc_result_card(kind, value, results):
+    """批量切换结果卡片:逐台列出成功/失败,全成功绿头、部分成功橙头、全失败红头"""
+    label = "供应商" if kind == "provider" else "模型"
+    succeeded = sum(1 for _, ok, _ in results if ok)
+    lines = [f"**{label} `{value}`** — 成功 {succeeded}/{len(results)}"]
+    for project, ok, detail in results:
+        lines.append(f"{'✅' if ok else '❌'} `{project}`" + (f" — {detail}" if detail else ""))
+    if succeeded == len(results):
+        template, icon = "green", "✅"
+    elif succeeded == 0:
+        template, icon = "red", "❌"
+    else:
+        template, icon = "orange", "⚠️"
+    elements = [
+        {"tag": "markdown", "content": "\n".join(lines)},
+        _button_columns([
+            _callback_button("🔌 供应商列表", {"a": "cp"}),
+            _callback_button("🧠 模型列表", {"a": "cm"}),
+        ]),
+    ]
+    return _clash_card(f"{icon} {label}切换结果", "", elements, template=template)
+
+
+def start_cc_switch(api_client, message_id, kind, value):
+    """后台执行批量切换并把结果回复到原消息;已有任务在跑时返回 False。
+
+    卡片回调必须在 3 秒内响应,十台切换做不到,故回调只负责起线程。
+    """
+    if not cc_switch_lock.acquire(blocking=False):
+        return False
+
+    def run():
+        try:
+            results = cc_switch_all(kind, value)
+            label = "供应商" if kind == "provider" else "模型"
+            if api_client is None or not message_id:
+                print(f"{label}批量切换完成:{results}", file=sys.stderr, flush=True)
+                return
+            card = build_cc_result_card(kind, value, results)
+            if not _reply(api_client, message_id, card, "interactive"):
+                lines = [f"{label} {value}:"]
+                lines += [
+                    f"{'成功' if ok else '失败'} {project}{(' — ' + detail) if detail else ''}"
+                    for project, ok, detail in results
+                ]
+                build_reply(api_client, message_id, "\n".join(lines))
+        except Exception as error:  # 后台线程异常必须自行兜住,否则静默丢结果
+            print(f"批量切换异常: {error!r}", file=sys.stderr, flush=True)
+            if api_client is not None and message_id:
+                build_reply(api_client, message_id, f"批量切换失败:{error!r}")
+        finally:
+            cc_switch_lock.release()
+
+    threading.Thread(target=run, daemon=True, name="cc-switch").start()
+    return True
+
+
+def make_card_action_handler(config, api_client=None):
     """卡片回传交互处理器:所有点击同步处理并返回新卡片(3 秒内),即点即更新"""
 
     def respond(card=None, toast_type=None, toast_text=None):
@@ -446,6 +750,30 @@ def make_card_action_handler(config):
                 if confirmed:
                     return respond(card=card, toast_type="success", toast_text=f"已切换到 {node}")
                 return respond(card=card, toast_type="error", toast_text="切换未生效,详见卡片")
+            # cc-connect 供应商 / 模型:列表、翻页、切换
+            if action == "cp":
+                return respond(card=build_cc_provider_card(1))
+            if action == "cm":
+                return respond(card=build_cc_model_card(1))
+            if action == "cq":
+                page = int(value.get("p", 1) or 1)
+                if value.get("k") == "model":
+                    return respond(card=build_cc_model_card(page))
+                return respond(card=build_cc_provider_card(page))
+            if action == "cv":
+                kind, target = value.get("k", ""), value.get("n", "")
+                if kind not in ("provider", "model") or not target:
+                    return respond(toast_type="warning", toast_text="切换参数无效")
+                context = getattr(event, "context", None)
+                message_id = getattr(context, "open_message_id", "") or ""
+                if not start_cc_switch(api_client, message_id, kind, target):
+                    return respond(toast_type="warning", toast_text="已有切换任务在进行中,请稍候")
+                label = "供应商" if kind == "provider" else "模型"
+                return respond(
+                    card=build_cc_switching_card(kind, target),
+                    toast_type="info",
+                    toast_text=f"开始切换{label}:{target}",
+                )
             return respond(toast_type="warning", toast_text="未知操作")
         except Exception as error:  # 回调异常同样要在 3 秒内给出响应
             return respond(toast_type="error", toast_text=f"处理失败:{error!r}"[:80])
@@ -727,6 +1055,21 @@ def main():
                         build_reply(api_client, message.message_id, "卡片发送失败,请检查 Clash(mihomo)是否在运行。")
                 except Exception as error:
                     build_reply(api_client, message.message_id, f"读取 Clash 状态失败:{error!r}")
+            # provider / model:列出候选项,点击后把 codex 及 codex1~codex9 一起切过去
+            elif command.lstrip("/").lower() in ("provider", "providers", "供应商"):
+                try:
+                    card = build_cc_provider_card(1)
+                    if not _reply(api_client, message.message_id, card, "interactive"):
+                        build_reply(api_client, message.message_id, "卡片发送失败。")
+                except Exception as error:
+                    build_reply(api_client, message.message_id, f"读取供应商列表失败:{error!r}")
+            elif command.lstrip("/").lower() in ("model", "models", "模型"):
+                try:
+                    card = build_cc_model_card(1)
+                    if not _reply(api_client, message.message_id, card, "interactive"):
+                        build_reply(api_client, message.message_id, "卡片发送失败。")
+                except Exception as error:
+                    build_reply(api_client, message.message_id, f"读取模型列表失败:{error!r}")
             else:
                 output, returncode, elapsed = run_shell(command)
                 try:
@@ -738,7 +1081,7 @@ def main():
 
     builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
     try:
-        builder = builder.register_p2_card_action_trigger(make_card_action_handler(config))
+        builder = builder.register_p2_card_action_trigger(make_card_action_handler(config, api_client))
     except AttributeError:
         # 旧版 lark-oapi 没有卡片回调注册能力;降级为仅消息命令,不影响既有功能
         print("当前 lark-oapi 不支持卡片回传交互,clash 卡片按钮将不可用", file=sys.stderr, flush=True)
