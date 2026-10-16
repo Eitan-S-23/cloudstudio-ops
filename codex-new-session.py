@@ -202,8 +202,8 @@ def bridge_cfg():
 
 
 def bridge_call(port: int, token: str, method: str, path: str, body=None):
-    """请求 bridge 接口。返回 (ok, data)：ok 时 data 为解析后的 JSON；
-    否则 data 为错误描述（不含 token）。"""
+    """请求 bridge 接口。返回 (ok, data)：ok 时 data 为业务数据（容器版响应带
+    {"ok","data"} 信封，这里已拆封）；否则 data 为错误描述（不含 token）。"""
     url = f"http://127.0.0.1:{port}{path}"
     payload = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=payload, method=method, headers={
@@ -213,7 +213,15 @@ def bridge_call(port: int, token: str, method: str, path: str, body=None):
     try:
         with OPENER.open(req, timeout=HTTP_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return True, json.loads(raw) if raw.strip() else {}
+        parsed = json.loads(raw) if raw.strip() else {}
+        # 容器版 bridge 把业务数据包了一层信封 {"ok":bool,"data":{...}}（2026-10-16 实测；
+        # 失败时可能是 {"ok":false,"error":...}，没有 data 键）。凡带 ok 键即按信封
+        # 拆封：成功取 data、失败判错；上游旧版直出（无 ok 键）原样返回，两种都兼容。
+        if isinstance(parsed, dict) and "ok" in parsed:
+            if not parsed.get("ok"):
+                return False, str(parsed.get("error") or parsed.get("data") or parsed)[:500]
+            return True, parsed.get("data") or {}
+        return True, parsed
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
