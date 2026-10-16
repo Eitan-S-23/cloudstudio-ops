@@ -13,7 +13,8 @@ status 命令直接读容器自身的 cgroup 与 /proc 数据(free/uptime 读到
 model 命令回复下拉选择卡片,抽屉里选中即把 codex 与 codex1~codex9 全部切到所选
 供应商或模型(cc-connect 管理接口 127.0.0.1:9820);同时支持与 cc-connect 自带
 体验一致的文本指令:/provider list|switch|current|repair|diag、/model
-list|switch|current。cc-connect 自带的 /provider switch 会把所选供应商记进会话,
+list|switch|current(与 cc-connect 一致,/model 接受 1 起序号或任意名称,列表外的
+名称原样设置即「新增模型」,仅 /provider 会校验名称并回「未找到」)。cc-connect 自带的 /provider switch 会把所选供应商记进会话,
 之后心跳(每 30 分钟唤醒会话)一到就会用旧记录把供应商改回去,故切换前会清理这类
 残留(必要时重启 cc-connect),切换后自动触发一次心跳做端到端自检。另有后台线程
 每分钟拉取 GitHub 部署仓库(OPS_REPO)的清单,版本变化时自动下载校验并应用,
@@ -921,15 +922,25 @@ def cc_resolve_provider_arg(argument):
 
 
 def cc_resolve_model_arg(argument):
-    """把 model 参数(1 起序号或模型名)解析为模型名;解析不了返回 None"""
+    """把 model 参数解析为模型名(对齐 cc-connect 自带语义)。
+
+    1 起序号按列表解析(越界则原样当模型名);别名/名称大小写不敏感匹配
+    规范化;都不命中时**原样使用** —— cc-connect 允许直接设置列表外的
+    模型名(相当于新增模型),不报「未找到」。仅空参数返回 None。
+    """
     models, _ = cc_list_models(cc_probe_project())
-    if argument.isdigit():
-        index = int(argument)
-        return models[index - 1] if 1 <= index <= len(models) else None
+    text = argument.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        index = int(text)
+        if 1 <= index <= len(models):
+            return models[index - 1]
+        return text
     for name in models:
-        if name.lower() == argument.lower():
+        if name.lower() == text.lower():
             return name
-    return None
+    return text
 
 
 def start_cc_switch_with_notice(api_client, message_id, kind, value):
@@ -1022,9 +1033,10 @@ def handle_cc_text_command(api_client, message_id, kind, args):
                 build_reply(api_client, message_id, f'❌ 未找到 Provider "{target}"。使用 `/provider list` 查看可用列表。')
                 return
         else:
+            # cc-connect 的 /model 不校验列表:未命中的名称原样设置(相当于新增模型)
             name = cc_resolve_model_arg(target)
             if name is None:
-                build_reply(api_client, message_id, f'❌ 未找到模型 "{target}"。使用 `/model list` 查看可用列表。')
+                build_reply(api_client, message_id, CC_USAGE_MODEL)
                 return
         start_cc_switch_with_notice(api_client, message_id, kind, name)
     except Exception as error:
