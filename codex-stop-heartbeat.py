@@ -3,7 +3,7 @@
 """
 codex-stop-heartbeat.py — 一键停止 codex1~codex9 的心跳（在 codex1 的 /cron 卡片点 enable 即执行）
 
-做三件事（monkey-codex 项目 codex 不碰）：
+做三件事（腾讯容器-codex 项目 codex 不碰）：
   1. 读各台心跳状态；把仍在跑的逐个 pause（POST /api/v1/projects/<项目>/heartbeat/pause，
      等价 /heartbeat stop）。停止逻辑复用 codex-recovery-watch.py 的 pause_all（按文件
      路径加载，不复制代码）。
@@ -188,7 +188,7 @@ def main() -> int:
         return 1
 
     w.notify(cfg, "⏹ 已一键停止 codex1~codex9 的心跳（等同 /heartbeat stop）。"
-                  "monkey-codex 不受影响。需要再启动时，点「一键恢复 codex1~9 心跳」任务即可。")
+                  "腾讯容器-codex 不受影响。需要再启动时，点「一键恢复 codex1~9 心跳」任务即可。")
     disable_self(cfg)
     log(f"全部 9 台心跳已停止（本次从运行中停掉：{', '.join(running)}），并已发送通知")
     return 0
