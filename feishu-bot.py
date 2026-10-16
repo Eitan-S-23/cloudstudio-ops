@@ -12,9 +12,11 @@ status 命令直接读容器自身的 cgroup 与 /proc 数据(free/uptime 读到
 (mihomo 控制 API 127.0.0.1:9090),卡片回传交互经长连接接收。provider 与
 model 命令回复下拉选择卡片,抽屉里选中即把 codex 与 codex1~codex9 全部切到所选
 供应商或模型(cc-connect 管理接口 127.0.0.1:9820);同时支持与 cc-connect 自带
-体验一致的文本指令:/provider list|switch|current|repair|diag、/model
-list|switch|current(与 cc-connect 一致,/model 接受 1 起序号或任意名称,列表外的
-名称原样设置即「新增模型」,仅 /provider 会校验名称并回「未找到」)。cc-connect 自带的 /provider switch 会把所选供应商记进会话,
+体验一致的文本指令:/provider list|switch|current|add|remove|clear|repair|diag、
+/model list|switch|current(与 cc-connect 一致,/model 接受 1 起序号或任意名称,列表外的
+名称原样设置即「新增模型」,仅 /provider 会校验名称并回「未找到」;/provider add
+支持位置式与 JSON 式并逐台添加,remove 逐台移除(使用中的会提示先切换),clear
+把十台恢复默认 Provider——管理接口没有清除端点,改为改写配置后重启生效)。cc-connect 自带的 /provider switch 会把所选供应商记进会话,
 之后心跳(每 30 分钟唤醒会话)一到就会用旧记录把供应商改回去,故切换前会清理这类
 残留(必要时重启 cc-connect),切换后自动触发一次心跳做端到端自检。另有后台线程
 每分钟拉取 GitHub 部署仓库(OPS_REPO)的清单,版本变化时自动下载校验并应用,
@@ -547,6 +549,51 @@ def cc_switch_all(kind, value):
     return results
 
 
+def cc_add_provider_all(name, api_key, base_url="", model="", env=None):
+    """给十台项目逐个添加 Provider(对齐 cc-connect 的 /provider add)。
+
+    管理接口的 POST 不查重(重复添加只在内存里追加、配置层错误被忽略),
+    故调用方需先读列表自查;这里逐台添加,单台失败不影响其余。api_key 只随
+    请求体发送,绝不出现在任何回复或日志里。
+    """
+    payload = {"name": name, "api_key": api_key}
+    if base_url:
+        payload["base_url"] = base_url
+    if model:
+        payload["model"] = model
+    if env:
+        payload["env"] = env
+    results = []
+    for project in CC_PROJECTS:
+        try:
+            cc_api("POST", f"/api/v1/projects/{cc_project_path(project)}/providers", payload)
+            results.append((project, True, ""))
+        except Exception as error:
+            results.append((project, False, str(error)[:160]))
+    return results
+
+
+def cc_remove_provider_all(name):
+    """从十台项目逐个移除 Provider(对齐 cc-connect 的 /provider remove)。
+
+    管理接口禁止移除**正在使用**的 Provider(400 cannot remove active
+    provider),这类失败翻译成可操作的中文提示;名称是否存在由调用方先行
+    校验(与上游 MsgProviderNotFound 行为一致)。
+    """
+    results = []
+    for project in CC_PROJECTS:
+        path = f"/api/v1/projects/{cc_project_path(project)}/providers/{cc_project_path(name)}"
+        try:
+            cc_api("DELETE", path)
+            results.append((project, True, ""))
+        except Exception as error:
+            detail = str(error)[:160]
+            if "cannot remove active provider" in detail:
+                detail = "该 Provider 正在使用中,先 `/provider switch <其它名称>` 切换后再移除"
+            results.append((project, False, detail))
+    return results
+
+
 # ---------- 「心跳回切」修复:清掉会话里的旧 Provider 记录 ----------
 # cc-connect 自带的 /provider switch 会把所选 Provider 记进**该会话**(内存与会话
 # 文件);此后会话每次重新 start 都会经 restoreActiveProviderFromSession 用这条记录
@@ -733,6 +780,117 @@ def cc_repair_if_needed(force=False):
     return lines
 
 
+# ---------- 清除 Provider 选择(/provider clear):只改配置 + 重启 ----------
+# 管理接口没有「清除活跃 Provider」端点:activate 要求给出存在的名称(空名会被
+# ServeMux 的 // 路径清理重定向掉),而 /reload 在 provider 键为空时压根不会调用
+# SetActiveProvider(main.go 载入逻辑),内存里已选的 Provider 原样保留。故按
+# cc-connect 自己的持久化写法(SaveActiveProvider → 项目段内写 provider 键)把
+# 十台的 provider 键清成空串,重启进程让全新实例以「无活跃 Provider」启动。
+# 顺序:先停机(退出时会原子保存会话,先改会被写回)→ 清会话残留(否则下次心跳
+# 又用旧记录覆盖)→ 改写配置(内存与 .bak 各留备份)→ 等看门狗拉起 → 逐台验证。
+
+CC_PROVIDER_KEY_RE = re.compile(r'^(\s*)provider\s*=\s*("[^"]*"|\S+)(\s*(?:#.*)?)$')
+
+
+def cc_edit_provider_keys(lines, value=""):
+    """就地改写 lines:管家十台项目 options 段内的 provider 键 → provider = "<value>"。
+
+    逐行跟踪 TOML 段结构:[[projects]] 开启新项目段,其后、首个子段之前的 name
+    键确定项目名;只有该项目的 [projects.agent.options] **主段**内的 provider 键
+    才命中——其子段 [projects.agent.options.env] 与供应商定义段
+    [[projects.agent.providers]] 绝不触碰。返回被改写的行号列表(value 为空串
+    即清空选择,与 cc-connect 空值持久化的写法一致)。
+    """
+    changed = []
+    project = None
+    in_options = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            if stripped == "[[projects]]":
+                project, in_options = None, False
+            else:
+                in_options = project in CC_PROJECTS and stripped == "[projects.agent.options]"
+            continue
+        if project is None:
+            match = re.match(r'\s*name\s*=\s*"([^"]+)"', line)
+            if match:
+                project = match.group(1)
+            continue
+        if in_options:
+            match = CC_PROVIDER_KEY_RE.match(line)
+            if match:
+                if match.group(2) == f'"{value}"':
+                    continue  # 已是目标值:保持原行不动,幂等(重发 clear 不会重复改)
+                lines[index] = f'{match.group(1)}provider = "{value}"{match.group(3)}'
+                changed.append(index)
+    return changed
+
+
+def cc_clear_provider_state():
+    """执行 /provider clear:十台恢复「默认 Provider」;返回 (是否成功, 说明行列表)"""
+    cc_dir = CC_CONFIG_PATH.parent
+    lines = ["🧹 清除十台的 Provider 选择(恢复默认)"]
+    if (cc_dir / ".stop").exists():
+        return False, lines + [f"❌ 存在手动停机标记 {cc_dir / '.stop'},未清除;删除它后重试"]
+    try:
+        original = CC_CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError as error:
+        return False, lines + [f"❌ 读取配置失败:{error}"]
+    edited = original.splitlines()
+    changed = cc_edit_provider_keys(edited, "")
+    if not changed:
+        return True, ["ℹ️ 配置里十台本就没有 Provider 选择,无需清除(未做任何改动)"]
+    pids = _cc_pids()
+    if pids:
+        lines.append(f"1️⃣ 停止 cc-connect({len(pids)} 个进程,最多等 20 秒)…")
+        run_shell("kill -TERM " + " ".join(pids), timeout=15)
+        if not _wait(lambda: not _cc_pids(), 20):
+            run_shell("kill -9 " + " ".join(_cc_pids()), timeout=15)
+            if not _wait(lambda: not _cc_pids(), 8):
+                return False, lines + ["❌ cc-connect 未能停止,已放弃(配置未改动)"]
+    else:
+        lines.append("1️⃣ cc-connect 当前未运行,跳过停止")
+    files_hit, fields_hit, failures = cc_session_provider_records(apply_changes=True)
+    lines.append(f"2️⃣ 清除会话残留:{fields_hit} 条旧 Provider 记录(涉及 {files_hit} 个文件)")
+    if failures:
+        lines.append("⚠️ 未能处理:" + ";".join(failures[:3]))
+    backup = cc_dir / "config.toml.provider-clear.bak"
+    try:
+        backup.write_text(original, encoding="utf-8", newline="\n")
+        updated = "\n".join(edited) + ("\n" if original.endswith("\n") else "")
+        tmp = cc_dir / "config.toml.provider-clear.tmp"
+        tmp.write_text(updated, encoding="utf-8", newline="\n")
+        os.replace(tmp, CC_CONFIG_PATH)
+    except OSError as error:
+        return False, lines + [f"❌ 改写配置失败:{error}(原文件未动,备份 {backup})"]
+    lines.append(f"3️⃣ 配置已改写:{len(changed)} 处 provider 键清空(原文件备份为 {backup.name})")
+    if not _wait(lambda: bool(_cc_pids()), 45):
+        run_shell(f"bash {cc_dir / 'start-all.sh'}", timeout=30)
+        if not _wait(lambda: bool(_cc_pids()), 30):
+            return False, lines + ["❌ cc-connect 未被拉起,请用状态命令检查"]
+    lines.append("4️⃣ cc-connect 已被看门狗拉起")
+    if not _wait(_cc_api_ready, 30, interval=2):
+        return False, lines + ["❌ 进程已起但管理接口未就绪,稍后用 /provider current 复查"]
+    lines.append("5️⃣ 管理接口就绪")
+    leftover = []
+    for project in CC_PROJECTS:
+        try:
+            _, active = cc_list_providers(project)
+        except Exception as error:
+            leftover.append(f"{project}(读取失败:{str(error)[:60]})")
+            continue
+        if active:
+            leftover.append(f"{project}(仍为 {active})")
+    if leftover:
+        return False, lines + [
+            "⚠️ 以下项目仍留有 Provider:" + ";".join(leftover),
+            f"可重发 /provider clear 重试;配置备份在 {backup}",
+        ]
+    lines.append("✅ Provider 已清除，新会话将使用默认 Provider。")
+    return True, lines
+
+
 def cc_heartbeat_status(project):
     """读某项目的心跳调度状态(run_count / skipped_busy / last_run 等)"""
     return cc_api(
@@ -820,18 +978,27 @@ def cc_verify_provider_sticky(expected):
 
 # ---------- provider / model 的文本指令(对齐 cc-connect 自带体验) ----------
 # cc-connect 自带 /provider、/model 的文本用法:list 清单(当前项用 ▶ / > 标出)、
-# switch <名称|序号> 切换、current 当前值;文案逐条对齐上游中文串。管家机器人覆盖
-# 十台项目,清单以 codex 项目为来源(十台配置同源),当前值汇总十台展示。另加两项
-# 管家特有命令:repair(清残留 + 重启)与 diag(体检)。任何 provider/model 开头的
-# 命令都走这里,绝不再落到 shell 执行。
+# switch <名称|序号> 切换、current 当前值、add 添加(位置式/JSON)、remove 移除、
+# clear 恢复默认;文案逐条对齐上游中文串。管家机器人覆盖十台项目,清单以 codex
+# 项目为来源(十台配置同源),当前值汇总十台展示。add/remove 逐台执行并汇总;
+# clear 改写配置后重启生效。另加两项管家特有命令:repair(清残留 + 重启)与
+# diag(体检)。任何 provider/model 开头的命令都走这里,绝不再落到 shell 执行。
 
 CC_USAGE_PROVIDER = (
-    "用法:`/provider list` 查看全部,`/provider switch <名称>` 切换,"
-    "`/provider current` 看当前值,`/provider repair` 修复心跳回切,`/provider diag` 体检。"
+    "用法:`/provider list` 查看全部,`/provider switch <名称>` 切换,`/provider current` 看当前值,"
+    "`/provider add <名称> <api_key> [base_url] [model]` 添加,`/provider remove <名称>` 移除,"
+    "`/provider clear` 恢复默认,`/provider repair` 修复心跳回切,`/provider diag` 体检。"
 )
 CC_USAGE_MODEL = (
     "用法: `/model list` 查看全部,`/model switch <序号>` 或 `/model switch <模型名>` 切换,"
     "也可直接发 `/model <模型名>`。"
+)
+# 与 cc-connect 的 MsgProviderAddUsage 中文串逐字一致
+CC_PROVIDER_ADD_USAGE = (
+    "用法:\n\n"
+    "`/provider add <名称> <api_key> [base_url] [model]`\n\n"
+    "或 JSON:\n"
+    '`/provider add {"name":"relay","api_key":"sk-xxx","base_url":"https://...","model":"..."}`'
 )
 
 
@@ -943,6 +1110,118 @@ def cc_resolve_model_arg(argument):
     return text
 
 
+def handle_cc_provider_add(api_client, message_id, target):
+    """`/provider add …`:位置式与 JSON 式,语义与文案对齐 cc-connect。
+
+    JSON 以 "{" 开头(与上游一致):先解析、校验 name、再查重;位置式至少需要
+    <名称> <api_key>。查重在本地先做——管理接口的 POST 自己不做(重复添加会
+    静默追加)。随后逐台添加并汇总结果。api_key 只用于请求体,绝不回显。
+    """
+    if not target:
+        build_reply(api_client, message_id, CC_PROVIDER_ADD_USAGE)
+        return
+    if cc_switch_lock.locked():
+        build_reply(api_client, message_id, "有切换/清除任务正在进行中,请稍候再试。")
+        return
+    if target.startswith("{"):
+        try:
+            parsed = json.loads(target)
+        except ValueError as error:
+            build_reply(api_client, message_id, f"❌ 添加 Provider 失败: invalid JSON: {error}")
+            return
+        if not isinstance(parsed, dict) or not str(parsed.get("name") or "").strip():
+            build_reply(api_client, message_id, '❌ 添加 Provider 失败: "name" is required')
+            return
+        name = str(parsed["name"]).strip()
+        api_key = str(parsed.get("api_key") or "")
+        base_url = str(parsed.get("base_url") or "")
+        model = str(parsed.get("model") or "")
+        env = parsed.get("env") if isinstance(parsed.get("env"), dict) else None
+    else:
+        parts = target.split()
+        if len(parts) < 2:
+            build_reply(api_client, message_id, CC_PROVIDER_ADD_USAGE)
+            return
+        name, api_key = parts[0], parts[1]
+        base_url = parts[2] if len(parts) > 2 else ""
+        model = parts[3] if len(parts) > 3 else ""
+        env = None
+    try:
+        providers, _ = cc_list_providers(cc_probe_project())
+    except Exception as error:
+        build_reply(api_client, message_id, f"❌ 添加 Provider 失败: {error}")
+        return
+    if name in [item.get("name") for item in providers]:
+        build_reply(api_client, message_id, f'❌ 添加 Provider 失败: provider "{name}" already exists')
+        return
+    results = cc_add_provider_all(name, api_key, base_url, model, env)
+    failed = [(project, detail) for project, ok, detail in results if not ok]
+    if not failed:
+        build_reply(api_client, message_id, (
+            f"✅ Provider **{name}** 已添加(codex 及 codex1~codex9 共 {len(results)} 台)。\n\n"
+            f"使用 `/provider switch {name}` 激活。"
+        ))
+        return
+    lines = [f"⚠️ Provider **{name}** 添加结果:成功 {len(results) - len(failed)}/{len(results)} 台。"]
+    lines += [f"❌ `{project}` — {detail}" for project, detail in failed]
+    lines.append("未添加成功的台可重发同一条命令重试(已成功的会提示 already exists 并跳过)。")
+    build_reply(api_client, message_id, "\n".join(lines))
+
+
+def handle_cc_provider_remove(api_client, message_id, name):
+    """`/provider remove <名称>`:先按上游语义校验名称存在,再逐台移除并汇总"""
+    if cc_switch_lock.locked():
+        build_reply(api_client, message_id, "有切换/清除任务正在进行中,请稍候再试。")
+        return
+    try:
+        providers, _ = cc_list_providers(cc_probe_project())
+    except Exception as error:
+        build_reply(api_client, message_id, f"❌ 移除 Provider 失败: {error}")
+        return
+    if name not in [item.get("name") for item in providers]:
+        build_reply(api_client, message_id, f'❌ 未找到 Provider "{name}"。使用 `/provider list` 查看可用列表。')
+        return
+    results = cc_remove_provider_all(name)
+    failed = [(project, detail) for project, ok, detail in results if not ok]
+    if not failed:
+        build_reply(api_client, message_id,
+                    f"✅ Provider **{name}** 已移除(codex 及 codex1~codex9 共 {len(results)} 台)。")
+        return
+    lines = [f"⚠️ Provider **{name}** 移除结果:成功 {len(results) - len(failed)}/{len(results)} 台。"]
+    lines += [f"❌ `{project}` — {detail}" for project, detail in failed]
+    build_reply(api_client, message_id, "\n".join(lines))
+
+
+def start_cc_clear(api_client, message_id):
+    """`/provider clear`:回进行中提示并起后台线程执行(含重启 cc-connect,约 1 分钟)
+
+    与批量切换共用 cc_switch_lock:同一时刻只允许一个批量任务。
+    """
+    if not cc_switch_lock.acquire(blocking=False):
+        build_reply(api_client, message_id, "已有切换任务在进行中,请稍候。")
+        return
+
+    def run():
+        try:
+            _, lines = cc_clear_provider_state()
+            build_reply(api_client, message_id, "\n".join(lines))
+        except Exception as error:  # 后台线程异常必须自行兜住,否则静默丢结果
+            print(f"清除 Provider 异常: {error!r}", file=sys.stderr, flush=True)
+            build_reply(api_client, message_id, f"清除 Provider 失败:{error!r}")
+        finally:
+            cc_switch_lock.release()
+
+    build_reply(api_client, message_id, (
+        "⏳ 正在清除十台的 Provider 选择(恢复默认):需要时会先清会话残留并重启 "
+        "cc-connect(约 1 分钟),完成后回复结果。"
+    ))
+    try:
+        threading.Thread(target=run, daemon=True, name="cc-clear").start()
+    except BaseException:
+        cc_switch_lock.release()  # 线程没起来就必须把锁放掉,否则后续任务全被挡
+        raise
+
+
 def start_cc_switch_with_notice(api_client, message_id, kind, value):
     """文本指令入口:先起后台批量切换,再回一条进行中提示(结果单独回卡片)"""
     if not start_cc_switch(api_client, message_id, kind, value):
@@ -986,8 +1265,9 @@ def handle_cc_text_command(api_client, message_id, kind, args):
     """provider / model 文本指令入口(不带参数时回下拉卡片)。
 
     语义与文案对齐 cc-connect 自带的 /provider、/model:list / switch /
-    current,外加管家特有的 repair、diag;`/provider <名称>` 视为 switch 的
-    便捷写法。未知子命令只回用法说明,不会落到 shell 执行。
+    current,provider 另有 add(位置式/JSON)、remove、clear,外加管家特有的
+    repair、diag;`/provider <名称>` 视为 switch 的便捷写法。未知子命令只回
+    用法说明,不会落到 shell 执行。
     """
     label = "Provider" if kind == "provider" else "模型"
     usage = CC_USAGE_PROVIDER if kind == "provider" else CC_USAGE_MODEL
@@ -1014,17 +1294,30 @@ def handle_cc_text_command(api_client, message_id, kind, args):
         if kind == "provider" and sub in ("diag", "诊断", "体检"):
             build_reply(api_client, message_id, cc_diag_text())
             return
+        if kind == "provider" and sub in ("add", "新增"):
+            handle_cc_provider_add(api_client, message_id, " ".join(args[1:]).strip())
+            return
+        if kind == "provider" and sub in ("remove", "rm", "delete", "删除"):
+            if len(args) < 2:
+                # 上游缺参时的原文案就是这句英文
+                build_reply(api_client, message_id, "Usage: /provider remove <name>")
+                return
+            handle_cc_provider_remove(api_client, message_id, args[1])
+            return
+        if kind == "provider" and sub in ("clear", "reset", "none", "清除", "重置"):
+            start_cc_clear(api_client, message_id)
+            return
+        if sub in ("add", "remove", "rm", "delete", "clear", "reset", "none",
+                   "新增", "删除", "清除", "重置"):
+            # /model 没有这些子命令(与 cc-connect 一致),只回用法说明
+            build_reply(api_client, message_id, usage)
+            return
         if sub in ("switch", "切换"):
             if len(args) < 2:
                 # 上游缺参时的原文案就是这句英文
                 build_reply(api_client, message_id, "Usage: /provider switch <name>" if kind == "provider" else CC_USAGE_MODEL)
                 return
             target = args[1]
-        elif sub in ("add", "remove", "rm", "delete", "clear", "reset", "none",
-                     "新增", "删除", "清除", "重置"):
-            # 上游还有这些子命令,管家机器人只做批量切换,不支持改动配置
-            build_reply(api_client, message_id, usage)
-            return
         else:
             target = args[0]
         if kind == "provider":
