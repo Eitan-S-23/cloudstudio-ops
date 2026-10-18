@@ -12,6 +12,8 @@
 
 | 文件 | 用途 |
 |---|---|
-| `feishu-bot.py` | 飞书命令机器人(命令执行、状态卡片、clash 节点切换卡片、cc-connect 供应商/模型切换卡片、自动部署轮询) |
+| `feishu-bot.py` | 飞书命令机器人(命令执行、状态卡片、clash 节点切换卡片、代理开关卡片、cc-connect 供应商/模型切换卡片、自动部署轮询) |
 | `run-new-api.sh` | new-api 与机器人的启动脚本(preview.yml 调用) |
+| `tencent-proxy` | Clash/agent 代理一键开关(`on`/`off`/`status`),由 clash 卡片调用 |
+| `set-agent-proxy.py` | 读写 `cc-connect/config.toml` 的 agent 代理变量,供 `tencent-proxy` 调用 |
 | `manifest.json` | 部署清单:版本号 + 文件哈希 |

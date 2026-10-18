@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# =============================================================================
+# 腾讯 Cloud Studio 容器：Clash 代理一键开关
+#
+# 用法：
+#   tencent-proxy status   只读巡检，不改配置、不重启
+#   tencent-proxy on       启动 mihomo → 等 9090 就绪 → 给 agent 挂代理（重启 cc-connect）
+#   tencent-proxy off      摘掉 agent 代理 → 停 mihomo（重启 cc-connect）
+#
+# 与 Instabox 的 instabox-proxy 对齐，但腾讯容器没有 systemd，也没有 .enabled：
+#   - 内核是否存在，直接看 /workspace/clash/mihomo 进程；
+#   - agent 是否挂代理，直接读 config.toml 的 [projects.agent.options.env]；
+#   - 不写状态标记，避免“标记还在、进程早没了”的假状态。
+#
+# 开关切换会重启 cc-connect（watchdog 约 10 秒拉起），正在进行的对话会中断。
+# =============================================================================
+set -Eeuo pipefail
+
+CC_DIR="${CC_DIR:-/workspace/cc-connect}"
+CLASH_DIR="${CLASH_DIR:-/workspace/clash}"
+PYTHON="${PYTHON:-python3}"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROXY_PY="$CC_DIR/set-agent-proxy.py"
+# 自动部署通道只能把文件放在 /workspace 根目录；此时 set-agent-proxy.py
+# 与本脚本同目录，按同目录回退，避免再要求一次手工安装。
+if [ ! -f "$PROXY_PY" ] && [ -f "$SELF_DIR/set-agent-proxy.py" ]; then
+    PROXY_PY="$SELF_DIR/set-agent-proxy.py"
+fi
+CFG="$CC_DIR/config.toml"
+CLASH_INSTALL="$CC_DIR/clash-install.sh"
+START_ALL="$CC_DIR/start-all.sh"
+MIHOMO="$CLASH_DIR/mihomo"
+CTRL_URL="http://127.0.0.1:9090/version"
+
+die() { printf '❌ %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+用法: $(basename "$0") on|off|status
+
+  on      启动 mihomo 并给 codex/claude 挂代理（会重启 cc-connect）
+  off     摘掉 codex/claude 代理并停 mihomo（会重启 cc-connect）
+  status  只读巡检，不改配置、不重启
+
+环境变量:
+  CC_DIR     cc-connect 目录，默认 /workspace/cc-connect
+  CLASH_DIR  Clash 目录，默认 /workspace/clash
+  PYTHON     Python 解释器，默认 python3
+
+自动部署通道会把本脚本放到 /workspace/tencent-proxy（与 set-agent-proxy.py 同目录），
+管家 clash 卡片会优先调用它；手工安装器则放到 $CC_DIR 并链接为 /usr/local/bin/proxy。
+腾讯管家（飞书）也可以直接发：
+  clash on / clash off / clash status
+  proxy on / proxy off / proxy status
+EOF
+}
+
+mihomo_pid() {
+    pgrep -f "^${MIHOMO}( |$)" 2>/dev/null | head -n 1 || true
+}
+
+mihomo_running() {
+    [ -n "$(mihomo_pid)" ]
+}
+
+wait_ctrl() {
+    local i
+    for i in $(seq 1 20); do
+        if curl -fsS --max-time 2 "$CTRL_URL" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+start_kernel() {
+    if mihomo_running; then
+        if wait_ctrl; then
+            echo "mihomo      : 已在运行 (PID $(mihomo_pid))"
+            return 0
+        fi
+        die "mihomo 进程在，但 $CTRL_URL 无响应；先查 $CLASH_DIR/clash.log"
+    fi
+
+    [ -x "$MIHOMO" ] || die "缺内核 $MIHOMO；先按部署文档安装 Clash"
+
+    if [ -f "$CLASH_INSTALL" ]; then
+        echo "mihomo      : 未运行，调用 clash-install.sh 拉起"
+        bash "$CLASH_INSTALL" || die "clash-install.sh 失败，查看 $CLASH_DIR/clash.log"
+    elif [ -f "$START_ALL" ]; then
+        echo "mihomo      : 未运行，调用 start-all.sh 拉起"
+        bash "$START_ALL" || die "start-all.sh 失败"
+    else
+        die "缺 $CLASH_INSTALL 和 $START_ALL，无法拉起 mihomo"
+    fi
+
+    wait_ctrl || die "mihomo 已拉起但 $CTRL_URL 无响应；查看 $CLASH_DIR/clash.log"
+    echo "mihomo      : 已就绪 (PID $(mihomo_pid))"
+}
+
+stop_kernel() {
+    if ! mihomo_running; then
+        echo "mihomo      : 未运行"
+        return 0
+    fi
+
+    echo "mihomo      : 停止中 (PID $(mihomo_pid))"
+    pkill -TERM -f "^${MIHOMO}( |$)" 2>/dev/null || true
+
+    local i
+    for i in $(seq 1 10); do
+        if ! mihomo_running; then
+            echo "mihomo      : 已停止"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "mihomo      : 10 秒内未退出，强制停止"
+    pkill -KILL -f "^${MIHOMO}( |$)" 2>/dev/null || true
+    sleep 1
+    mihomo_running && die "mihomo 仍在运行 (PID $(mihomo_pid))"
+    echo "mihomo      : 已停止"
+}
+
+agent_on() {
+    [ -f "$PROXY_PY" ] || die "缺 $PROXY_PY；先执行 install-tencent-proxy.sh"
+    [ -f "$CFG" ] || die "缺配置文件 $CFG"
+    "$PYTHON" "$PROXY_PY" --config "$CFG" --on --restart || die "给 agent 挂代理失败"
+}
+
+agent_off() {
+    [ -f "$PROXY_PY" ] || die "缺 $PROXY_PY；先执行 install-tencent-proxy.sh"
+    [ -f "$CFG" ] || die "缺配置文件 $CFG"
+    "$PYTHON" "$PROXY_PY" --config "$CFG" --off --restart || die "摘掉 agent 代理失败"
+}
+
+status() {
+    local pid
+    pid="$(mihomo_pid)"
+    if [ -n "$pid" ]; then
+        echo "mihomo      : 运行中 (PID $pid)"
+    else
+        echo "mihomo      : 未运行"
+    fi
+
+    if curl -fsS --max-time 2 "$CTRL_URL" >/dev/null 2>&1; then
+        echo "控制 API    : 就绪 ($CTRL_URL)"
+    else
+        echo "控制 API    : 无响应"
+    fi
+
+    if [ -f "$PROXY_PY" ] && [ -f "$CFG" ]; then
+        echo "agent 代理  :"
+        "$PYTHON" "$PROXY_PY" --config "$CFG" || echo "  ⚠️ 读取 agent 代理状态失败"
+    elif [ ! -f "$PROXY_PY" ]; then
+        echo "agent 代理  : 缺 $PROXY_PY"
+    else
+        echo "agent 代理  : 缺配置文件 $CFG"
+    fi
+}
+
+case "${1:-}" in
+    on)
+        start_kernel
+        agent_on
+        echo
+        status
+        ;;
+    off)
+        agent_off
+        stop_kernel
+        echo
+        status
+        ;;
+    status|"")
+        status
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

@@ -250,6 +250,17 @@ def build_status_fields():
 
     pid = find_newapi()
     fields.append(("new-api 服务", f"✅ 运行中(PID {pid})" if pid else "❌ 未运行"))
+    try:
+        state = proxy_status()
+        if state["enabled"]:
+            proxy_text = "✅ 已开启"
+        elif state["mihomo_running"]:
+            proxy_text = "⚠️ mihomo 在跑,agent 未挂"
+        else:
+            proxy_text = "⏸ 已关闭"
+    except Exception:
+        proxy_text = "未知"
+    fields.append(("代理开关", proxy_text))
     return fields
 
 
@@ -319,44 +330,157 @@ def _clash_card(title, subtitle, elements, template="blue"):
     }
 
 
-def build_clash_group_card():
-    """一级卡片:策略组清单(仅 Selector 组,GLOBAL 排除),附各组当前选中项"""
-    proxies = mihomo_get_proxies()
+# ---------- Clash 代理开关(整合在 clash 卡片) ----------
+# 腾讯容器没有 systemd 和 .enabled:开关状态直接由 tencent-proxy 读取
+# mihomo 进程/9090 控制接口,以及 config.toml 里 agent 的代理变量。
+PROXY_HELPERS = (
+    "/workspace/tencent-proxy",
+    "/workspace/cc-connect/tencent-proxy",
+    "/usr/local/bin/proxy",
+)
+PROXY_API = "http://127.0.0.1:9090/version"
+
+
+def proxy_helper():
+    """优先使用自动部署下载到 /workspace 的版本,再退回手工安装位置。"""
+    for path in PROXY_HELPERS:
+        if os.path.isfile(path):
+            return path
+    return PROXY_HELPERS[0]
+
+
+def proxy_status():
+    """读取代理开关状态;helper 缺失或执行失败时返回可展示的错误,不抛异常。"""
+    helper = proxy_helper()
+    output = ""
+    try:
+        output, _, _ = run_shell(f"bash {helper} status", timeout=20)
+    except Exception as error:
+        output = f"读取失败:{error!r}"
+    output = output.strip()
+    mihomo_running = "mihomo      : 运行中" in output
+    api_ready = False
+    try:
+        with cc_opener.open(PROXY_API, timeout=2) as response:
+            api_ready = response.status == 200
+    except (OSError, ValueError):
+        pass
+    attached = output.count("✅ 已挂")
+    error = ""
+    if not output or "No such file or directory" in output or "command not found" in output:
+        error = f"开关程序不可用:{helper}"
+    return {
+        "output": output,
+        "mihomo_running": mihomo_running,
+        "api_ready": api_ready,
+        "attached": attached,
+        "enabled": mihomo_running and api_ready and attached > 0,
+        "error": error,
+    }
+
+
+def _proxy_summary(state):
+    if state["enabled"]:
+        head = "**代理开关:** ✅ 已开启"
+    elif state["mihomo_running"]:
+        head = "**代理开关:** ⚠️ mihomo 在运行,agent 未挂代理"
+    else:
+        head = "**代理开关:** ⏸ 已关闭(默认)"
+    lines = [
+        head,
+        f"**mihomo:** {'✅ 运行中' if state['mihomo_running'] else '❌ 未运行'}",
+        f"**控制 API:** {'✅ 就绪' if state['api_ready'] else '❌ 无响应'}",
+        f"**agent 代理:** {state['attached']} 台已挂" if state["attached"] else "**agent 代理:** ➖ 未挂",
+    ]
+    if state["error"]:
+        lines.append(f"**开关程序:** ❌ {state['error'][:160]}")
+    return "\n".join(lines)
+
+
+def run_proxy_action(action):
+    helper = proxy_helper()
+    output, returncode, _ = run_shell(f"bash {helper} {action}", timeout=90)
+    note = ("✅ " if returncode == 0 else "❌ ") + (output.strip() or f"退出码 {returncode}")
+    return returncode == 0, note
+
+
+def build_clash_group_card(note=""):
+    """一级卡片:代理开关 + 策略组清单(仅 Selector 组,GLOBAL 排除)。"""
+    state = proxy_status()
+    elements = [
+        {"tag": "markdown", "content": _proxy_summary(state)},
+        _button_columns([
+            _callback_button("🟢 开启代理", {"a": "x", "s": "on"}, style="primary"),
+            _callback_button("🔴 关闭代理", {"a": "x", "s": "off"}, style="danger"),
+            _callback_button("🔄 刷新状态", {"a": "x", "s": "status"}),
+        ]),
+    ]
+    if note:
+        elements.append({"tag": "markdown", "content": note})
+
+    mihomo_error = ""
+    try:
+        proxies = mihomo_get_proxies()
+    except Exception as error:
+        proxies = {}
+        mihomo_error = repr(error)[:160]
     groups = [
         (name, info)
         for name, info in proxies.items()
         if info.get("type") == "Selector" and name != "GLOBAL"
     ]
-    elements = []
-    for name, info in groups:
-        now = info.get("now") or "未选择"
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 3,
-                    "vertical_align": "center",
-                    "elements": [{"tag": "markdown", "content": f"**{name}**\n当前:{now}"}],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "vertical_align": "center",
-                    "elements": [_callback_button("切换", {"a": "g", "g": name})],
-                },
-            ],
-        })
-    if elements:
+    if groups:
+        elements.append({"tag": "markdown", "content": "---"})
+        for name, info in groups:
+            now = info.get("now") or "未选择"
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 3,
+                        "vertical_align": "center",
+                        "elements": [{"tag": "markdown", "content": f"**{name}**\n当前:{now}"}],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "vertical_align": "center",
+                        "elements": [_callback_button("切换", {"a": "g", "g": name})],
+                    },
+                ],
+            })
         elements.append(_button_columns([_callback_button("🔄 刷新当前状态", {"a": "b"})]))
-        subtitle = f"{len(groups)} 个策略组"
+        subtitle = f"代理开关 · {len(groups)} 个策略组"
+    elif mihomo_error:
+        elements.append({
+            "tag": "markdown",
+            "content": f"节点列表不可用:{mihomo_error}\n可先点「开启代理」拉起 mihomo。",
+        })
+        subtitle = "代理开关 · 节点不可用"
     else:
         elements.append({"tag": "markdown", "content": "未发现可手动切换(Selector)的策略组。"})
-        subtitle = ""
-    return _clash_card("🔀 Clash 节点切换", subtitle, elements)
+        subtitle = "代理开关"
+    return _clash_card("🔀 Clash 节点与代理", subtitle, elements)
+
+
+def handle_clash_text_command(api_client, message_id, args):
+    """clash [on|off|status]:无参数展示组合卡片,带参数则先执行代理动作。"""
+    mapping = {
+        "on": "on", "开": "on", "开启": "on", "启用": "on",
+        "off": "off", "关": "off", "关闭": "off", "停用": "off",
+        "status": "status", "状态": "status",
+    }
+    action = mapping.get((args[0] if args else "").lower())
+    note = ""
+    if action:
+        _, note = run_proxy_action(action)
+    card = build_clash_group_card(note)
+    if not _reply(api_client, message_id, card, "interactive"):
+        build_reply(api_client, message_id, note or "Clash 卡片发送失败,请检查 mihomo 是否在运行。")
 
 
 def build_clash_node_card(group, page=1):
@@ -1542,6 +1666,24 @@ def make_card_action_handler(config, api_client=None):
                     toast_type="info",
                     toast_text=f"开始切换{label}:{target}",
                 )
+            if action == "x":
+                sub = value.get("s", "status")
+                if sub in ("on", "off"):
+                    context = getattr(event, "context", None)
+                    message_id = getattr(context, "open_message_id", "") or ""
+
+                    def worker():
+                        try:
+                            _, note = run_proxy_action(sub)
+                            card = build_clash_group_card(note)
+                            if not _reply(api_client, message_id, card, "interactive"):
+                                build_reply(api_client, message_id, note)
+                        except Exception as error:  # 后台线程异常不能影响长连接
+                            print(f"代理切换后台任务异常: {error!r}", file=sys.stderr, flush=True)
+
+                    threading.Thread(target=worker, daemon=True, name="proxy-switch").start()
+                    return respond(toast_type="info", toast_text="正在切换代理,完成后在此回复…")
+                return respond(card=build_clash_group_card())
             if action == "b":
                 return respond(card=build_clash_group_card())
             if action == "g":
@@ -1741,8 +1883,12 @@ def route_command(command):
         return "cc", ("model", tokens[1:])
     if command in ("status", "状态"):
         return "status", None
-    if command in ("clash", "节点", "切换节点"):
-        return "clash", None
+    if head.startswith("代理") and len(head) > 2:
+        return "clash", [head[2:]] + tokens[1:]
+    if head in ("proxy", "代理", "clash开关"):
+        return "clash", tokens[1:]
+    if head in ("clash", "节点", "切换节点"):
+        return "clash", tokens[1:]
     return "shell", command
 
 
@@ -1870,9 +2016,7 @@ def main():
                     build_reply(api_client, message.message_id, f"状态采集失败:{error!r}")
             elif route == "clash":
                 try:
-                    card = build_clash_group_card()
-                    if not _reply(api_client, message.message_id, card, "interactive"):
-                        build_reply(api_client, message.message_id, "卡片发送失败,请检查 Clash(mihomo)是否在运行。")
+                    handle_clash_text_command(api_client, message.message_id, payload or [])
                 except Exception as error:
                     build_reply(api_client, message.message_id, f"读取 Clash 状态失败:{error!r}")
             # provider / model:下拉卡片或文本指令,切换与修复都作用于 codex 及 codex1~codex9
