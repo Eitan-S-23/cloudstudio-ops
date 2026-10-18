@@ -21,9 +21,9 @@ CLASH_DIR="${CLASH_DIR:-/workspace/clash}"
 PYTHON="${PYTHON:-python3}"
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_PY="$CC_DIR/set-agent-proxy.py"
-# 自动部署通道只能把文件放在 /workspace 根目录；此时 set-agent-proxy.py
-# 与本脚本同目录，按同目录回退，避免再要求一次手工安装。
-if [ ! -f "$PROXY_PY" ] && [ -f "$SELF_DIR/set-agent-proxy.py" ]; then
+# 自动部署通道把两个文件都放在 /workspace；同目录副本与脚本版本配套，
+# 优先使用它，避免被 cc-connect 里的旧副本抢先。
+if [ -f "$SELF_DIR/set-agent-proxy.py" ]; then
     PROXY_PY="$SELF_DIR/set-agent-proxy.py"
 fi
 CFG="$CC_DIR/config.toml"
