@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path('/workspace/cc-connect')
 TASK = 'CC_ROLLOUT_20261025'
-RUNNER_SHA = '30cf7ca6fa94b7d22c3d383a98ad78bd116cd7c237690385db1a829573d8bab1'
+RUNNER_SHA = '25cf8a46b3c8784521ce9137649ed37ee5ee91227d461e655b06b22236688537'
 
 
 def checked(path):

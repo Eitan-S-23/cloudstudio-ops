@@ -67,11 +67,12 @@ def atomic(path, data, mode=0o600):
             temp.unlink()
 
 
-def api(cfg, path):
+def api(cfg, path, method='GET'):
     m = cfg['management']
     request = urllib.request.Request('http://127.0.0.1:' + str(m.get('port', 9820))
                                     + '/api/v1/' + path,
-                                    headers={'Authorization': 'Bearer ' + m.get('token', '')})
+                                    headers={'Authorization': 'Bearer ' + m.get('token', '')},
+                                    method=method, data=b'' if method == 'POST' else None)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=5) as response:
         return json.load(response)['data']
@@ -137,6 +138,12 @@ def label():
     return '腾讯容器-codex'
 
 
+def stable_jobs(raw):
+    rows = raw if isinstance(raw, list) else raw['jobs']
+    return [{key: value for key, value in row.items() if key not in ('last_run', 'last_error')}
+            for row in rows]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', choices=['cloudstudio-ops', 'cloudstudio-ops2'], required=True)
@@ -165,8 +172,8 @@ def main():
               for n in ['codex'] + ['codex' + str(i) for i in range(1, 10)]}
     if any(not isinstance(d.get('paused'), bool) for d in hearts.values()):
         raise ValueError('heartbeat status unknown')
-    if hearts['codex']['paused'] or not hearts['codex'].get('enabled'):
-        raise ValueError('probe heartbeat is not running; do not guess the arming state')
+    if not hearts['codex'].get('enabled'):
+        raise ValueError('probe heartbeat is not configured; refusing to guess its configuration')
     if processes()[1]:
         raise ValueError('cron helper currently running; retry in an idle maintenance window')
     cycle_path = ROOT / 'data/codex-recovery-cycle.json'
@@ -260,8 +267,15 @@ def install(args, cfg, raw, jobs, found, hearts, cycle, stage, info):
         if processes()[0] or processes()[1]:
             raise ValueError('component did not quiesce')
         current = json.loads((ROOT / 'data/crons/jobs.json').read_text(encoding='utf-8'))
-        if current != raw:
+        if stable_jobs(current) != stable_jobs(raw):
             raise ValueError('job table changed during preflight; retry without overwriting it')
+        raw = current
+        jobs = raw if isinstance(raw, list) else raw['jobs']
+        found = {marker: [row for row in jobs if row.get('project') == 'codex1'
+                         and marker in row.get('exec', '')] for marker in MARKERS}
+        atomic(backup / 'data/crons/jobs.json', (ROOT / 'data/crons/jobs.json').read_bytes())
+        if (ROOT / 'data/heartbeat_state.json').exists():
+            atomic(backup / 'data/heartbeat_state.json', (ROOT / 'data/heartbeat_state.json').read_bytes())
         changed = True
         for name in HELPERS:
             atomic(ROOT / name, (stage / name).read_bytes(), 0o755)
@@ -284,6 +298,12 @@ def install(args, cfg, raw, jobs, found, hearts, cycle, stage, info):
         created_stop = False
         start_main()
         wait_api(cfg)
+        probe_resumed = hearts['codex']['paused']
+        if probe_resumed:
+            api(cfg, 'projects/codex/heartbeat/resume', 'POST')
+        probe = api(cfg, 'projects/codex/heartbeat/status')
+        if probe.get('paused') or not probe.get('enabled'):
+            raise ValueError('probe heartbeat did not resume')
         after = json.loads((ROOT / 'data/crons/jobs.json').read_text(encoding='utf-8'))
         rows = after if isinstance(after, list) else after['jobs']
         if len(rows) != 15 or len(processes()[0]) != 1:
@@ -292,6 +312,7 @@ def install(args, cfg, raw, jobs, found, hearts, cycle, stage, info):
         version = subprocess.check_output([str(ROOT / 'cc-connect'), '--version'],
                                           cwd=ROOT, text=True).strip()
         info.update({'ok': True, 'phase': phase, 'backup': str(backup), 'version': version,
+                     'probe_resumed': probe_resumed,
                      'notify_interaction_verified': False})
         atomic(ROOT / '.cc-rollout-result.json', (json.dumps(info) + '\n').encode())
         print(json.dumps(info))
