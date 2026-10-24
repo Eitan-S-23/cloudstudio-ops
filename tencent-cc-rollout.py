@@ -266,6 +266,10 @@ def finish(app_dir, cfg, repo, space, stage):
     data["helpers_match_staging"] = all(
         (ROOT / name).read_bytes() == (backup.parent / name).read_bytes() for name in helpers
     )
+    if not data["config_unchanged"] or not data["helpers_match_staging"]:
+        raise ValueError("configuration or helpers changed; refusing reconciliation")
+    reconcile(cfg, space, stage)
+    data.update(snapshot())
     # These two writes are the explicitly approved temporary butler restoration.
     archive = checked(stage / "temporary-hook.py")
     atomic(archive, module.read_bytes())
@@ -288,3 +292,72 @@ def finish(app_dir, cfg, repo, space, stage):
     data["temporary_hook_removed"] = not module.exists()
     atomic(stage / "final.json", (json.dumps(data) + "\n").encode())
     report(cfg, space, "verified", data)
+
+
+def reconcile(cfg, space, stage):
+    import datetime
+    import importlib.util
+    import re
+
+    before = snapshot()
+    events = []
+    path = ROOT / "cc.log"
+    if path.exists():
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - 256 * 1024))
+            for line in handle.read().decode("utf-8", "replace").splitlines():
+                match = re.search(r'msg="(heartbeat: (?:paused|resumed)|cron: [^"\n]+)"', line)
+                if match:
+                    timestamp = re.search(r"time=([^ ]+)", line)
+                    project = re.search(r"project=([a-z0-9]+)", line)
+                    events.append(
+                        {
+                            "time": timestamp.group(1) if timestamp else None,
+                            "event": match.group(1),
+                            "project": project.group(1) if project else None,
+                        }
+                    )
+    report(cfg, space, "diagnostic", {"snapshot": before, "scheduler_events": events[-25:]})
+    spec = importlib.util.spec_from_file_location("recovery_reconcile", ROOT / "codex-recovery-watch.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    config = mod.load_config()
+    with mod.cycle_lock() as acquired:
+        if not acquired:
+            raise ValueError("recovery handoff busy; refusing reconciliation")
+        cycle = mod.load_cycle()
+        running = mod.running_projects(config)
+        restore = mod.find_job(mod.RESTORE_MARKER)
+        upstream = mod.find_job(mod.UPSTREAM_MARKER)
+        stop = mod.find_job(mod.SELF_MARKER)
+        if running is None or not restore or not upstream or not stop:
+            raise ValueError("reconciliation state unknown")
+        if restore["enabled"] or cycle.get("phase") in ("triggered", "restoring"):
+            raise ValueError("recovery in progress; refusing reconciliation")
+        if not running:
+            if cycle.get("phase") != "monitoring":
+                atomic(stage / "cycle-before-reconcile.json", (json.dumps(cycle) + "\n").encode())
+                mod.save_cycle(
+                    {
+                        "phase": "monitoring",
+                        "monitor_since": datetime.datetime.now(datetime.UTC).isoformat(),
+                    }
+                )
+            if not mod.cron_edit(config, upstream, True) or not mod.cron_edit(config, stop, False):
+                raise ValueError("monitoring handoff reconciliation failed")
+        elif not mod.cron_edit(config, stop, True):
+            raise ValueError("normal-reply watcher reconciliation failed")
+        status, response = mod.api(config, "GET", "/projects/codex/heartbeat/status")
+        probe = json.loads(response)["data"]
+        if status != 200 or probe.get("enabled") is not True:
+            raise ValueError("probe heartbeat unavailable")
+        if probe.get("paused") is True:
+            status, _ = mod.api(config, "POST", "/projects/codex/heartbeat/resume")
+            if status != 200:
+                raise ValueError("probe heartbeat reconciliation failed")
+    time.sleep(80)
+    after = snapshot()
+    if after["hearts"]["codex"].get("paused") is not False:
+        raise ValueError("probe was paused again after reconciliation")
+    atomic(stage / "reconcile.json", (json.dumps({"before": before, "after": after}) + "\n").encode())
+    report(cfg, space, "reconciled", after)
