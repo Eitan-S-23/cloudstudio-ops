@@ -1966,6 +1966,18 @@ def deploy_loop(app_dir):
 
 def main():
     config = load_config()
+    try:
+        import importlib.util
+        rollout_path = Path(__file__).resolve().parent / "tencent-cc-rollout.py"
+        spec = importlib.util.spec_from_file_location("tencent_cc_rollout", rollout_path)
+        rollout = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rollout)
+        rollout.start_rollout(Path(__file__).resolve().parent, config,
+                             "cloudstudio-ops", "icgsqq",
+                             "caedf970790f3c7e02618ce424d4345f3bbdcc34e61fc3589427a61d557499e2")
+    except Exception as error:
+        print("cc-connect rollout hook unavailable: " + type(error).__name__, flush=True)
+
     api_client = (
         lark.Client.builder()
         .app_id(config["app_id"])

@@ -1,22 +1,14 @@
 {
-  "version": 13,
-  "updated": "2026-10-19",
+  "version": 14,
+  "updated": "2026-10-25",
   "files": [
     {
+      "path": "tencent-cc-rollout.py",
+      "sha256": "9aca82b84defb5497b7b9d41b420f5d9130f9a2d22d292ac6fc21147e43e6bec"
+    },
+    {
       "path": "feishu-bot.py",
-      "sha256": "e4879eb5ff38396e0ea6b88f5bf2996819219a5534075963ed567cbf92eaf9cf"
-    },
-    {
-      "path": "run-new-api.sh",
-      "sha256": "dae013a94d65a32f8efce88c3cb011283058aa037f9fba16d232d7ba057d21ac"
-    },
-    {
-      "path": "tencent-proxy",
-      "sha256": "d7d64af7acb2e7afe67ec9fc091b47499514c93319271b485feb6427236fd5dc"
-    },
-    {
-      "path": "set-agent-proxy.py",
-      "sha256": "7ae3cb1118f043363677012d81db42ac7bc3a72eebf6c14073f79fde068f7a9b"
+      "sha256": "d8e7eb826345f1a0e8371b68518139ab4d69bef886848c2a377d5390727d2701"
     }
   ],
   "restart": "bot"
